@@ -6,6 +6,22 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## Unreleased
+
+### Added
+
+- **Status channel event model (ADR-0001): debounce + heartbeat + decision-point readouts.** `pushStatus` now uses a trailing-edge 1s debounce window (intermediate states are dropped; the latest derived state is sent at the window edge), and a 60s unconditional heartbeat bounds peer-cache staleness at ≤60s while connected. Both apply in hub and client roles; `force` pushes bypass debounce and dedup. Hub stays a dumb fan-out (serialize-once-write-N preserved). Zero wire-format changes.
+- **Context readouts at decision points.** `link_send`, `link_prompt`, and `link_compact` success results now append the target terminal's context readout in full absolute form (`tokens/window (percent%)`, never percent alone) with a ` ⚠ hot` marker when headroom falls below `HOT_HEADROOM_TOKENS` (100K, absolute — percent is incomparable across window sizes; a knob is deferred per ADR-0001). Broadcast (`to:"*"`) gets no readout; missing cache entries / unknown tokens omit silently. `link_compact` shows before → after.
+- **Inbound chat hot-sender annotation.** Both delivery paths (steer and batched flush) append a `[⚠ "from" ctx … — headroom …, consider link_compact before dispatching]` line into message *content* for hot senders only, computed at delivery time (not render time). The scheduling audience is the receiving LLM.
+- **Three status-channel constants** (`STATUS_DEBOUNCE_MS = 1_000`, `HEARTBEAT_INTERVAL_MS = 60_000`, `HOT_HEADROOM_TOKENS = 100_000`) with threshold semantics + deferred-knob rationale documented inline per ADR-0001.
+- **Force-push before `prompt_response` (ADR-0001 invariant fix).** `agent_end` now calls `pushStatus(true)` immediately before emitting `prompt_response` for a remote prompt, in addition to the non-force push at the top of the handler. The non-force push can be swallowed by the trailing-edge debounce when the last tool-boundary send was <1s ago (the common case at a busy run's tail), which would let `prompt_response` — emitted synchronously in the same handler — reach the requester before the freshest `status_update`, breaking the push-before-response ordering the `link_prompt` readout relies on. The force push bypasses the debounce and cancels any pending timer, restoring the ordering guarantee exactly where a waiter consumes it. Cost: at most one extra `status_update` per remote prompt. The `compact` path needs no change: `session_compact` (force) fires before `onComplete`/`compact_response` per the Pi runtime contract.
+
+### Changed
+
+- **Busy-terminal event rate is capped at ~1 msg/s** (was several per tool boundary), and idle terminals now emit 1/60s (was 0 — net new but negligible: ~10 socket writes/s fleet-wide at 25 terminals).
+
+---
+
 ## 0.2.0 — 2026-07-17
 
 ### Added

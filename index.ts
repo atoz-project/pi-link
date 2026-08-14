@@ -33,6 +33,16 @@ const FLUSH_DELAY_MS = 200;
 const IDLE_RETRY_MS = 500;
 const BATCH_MAX_ITEMS = 20;
 const BATCH_MAX_CHARS = 16_000;
+// ADR-0001 status-channel event model. Trailing-edge debounce window for
+// pushStatus sends; unconditional heartbeat interval while connected; hot
+// terminal headroom threshold. Threshold semantics: hot ⇔ contextWindow −
+// tokens < HOT_HEADROOM_TOKENS (absolute, not percent — percent is
+// incomparable across window sizes, and Pi's own auto-compaction triggers on
+// an absolute reserve). A knob is deliberately deferred per ADR-0001 until a
+// real small-window user or upstream review demands it.
+const STATUS_DEBOUNCE_MS = 1_000;
+const HEARTBEAT_INTERVAL_MS = 60_000;
+const HOT_HEADROOM_TOKENS = 100_000;
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -208,6 +218,9 @@ export default function (pi: ExtensionAPI) {
       }) => void;
       targetName: string;
       timeout: ReturnType<typeof setTimeout>;
+      // ADR-0001: target context readout captured at request time, appended
+      // as `before → after` on the success result.
+      beforeReadout: string;
     }
   >();
 
@@ -218,6 +231,19 @@ export default function (pi: ExtensionAPI) {
   // Inbox: idle-gated batched delivery for triggerTurn:true messages
   const inbox: { from: string; content: string }[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ADR-0001: status-channel send-side event model state.
+  // Debounce: trailing-edge timer for pushStatus; arms/re-arms when a
+  // non-force push happens within STATUS_DEBOUNCE_MS of the last actual send,
+  // firing the latest derived state at the window edge. force=true bypasses
+  // and cancels any pending timer.
+  let statusDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastStatusSendAt = 0;
+  // Heartbeat: unconditional pushStatus(true) every HEARTBEAT_INTERVAL_MS
+  // while connected. Bounds peer-cache staleness (idle growth) and doubles as
+  // a liveness signal. Runs in both hub and client roles; no overlap with the
+  // remote-prompt keepalive (they coexist; force pushes dedupe by time).
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -268,14 +294,51 @@ export default function (pi: ExtensionAPI) {
 
   function pushStatus(force = false) {
     if (role === "disconnected") return;
+
+    // ADR-0001: force bypasses debounce and dedup; cancels any pending timer.
+    if (force) {
+      if (statusDebounceTimer) {
+        clearTimeout(statusDebounceTimer);
+        statusDebounceTimer = null;
+      }
+      doSendStatus();
+      return;
+    }
+
+    // Non-force: existing kind/tool dedup stays. Intermediate states are
+    // dropped (status is absolute, not incremental).
     const status = deriveStatus();
     const newKind = status.kind;
     const newTool = status.kind === "tool" ? status.toolName : null;
-    if (!force && newKind === lastPushedKind && newTool === lastPushedTool)
+    if (newKind === lastPushedKind && newTool === lastPushedTool) return;
+
+    // Trailing-edge debounce: if <1s since last actual send, arm/re-arm a
+    // single timer that sends the latest derived state at the window edge.
+    const elapsed = Date.now() - lastStatusSendAt;
+    if (elapsed >= STATUS_DEBOUNCE_MS) {
+      doSendStatus();
       return;
-    lastPushedKind = newKind;
-    lastPushedTool = newTool;
-    const context = captureContext(); // only when we actually push
+    }
+    if (statusDebounceTimer) clearTimeout(statusDebounceTimer);
+    statusDebounceTimer = setTimeout(() => {
+      statusDebounceTimer = null;
+      // Re-check dedup at the window edge: state may have reverted to the
+      // last-pushed kind/tool since the timer was armed.
+      const s = deriveStatus();
+      const k = s.kind;
+      const t = s.kind === "tool" ? s.toolName : null;
+      if (k === lastPushedKind && t === lastPushedTool) return;
+      doSendStatus();
+    }, STATUS_DEBOUNCE_MS - elapsed);
+  }
+
+  /** Encode + transmit a status_update now (no dedup, no debounce). */
+  function doSendStatus() {
+    const status = deriveStatus();
+    lastPushedKind = status.kind;
+    lastPushedTool = status.kind === "tool" ? status.toolName : null;
+    lastStatusSendAt = Date.now();
+    const context = captureContext(); // only when we actually send
     const msg: StatusUpdateMsg = {
       type: "status_update",
       name: terminalName,
@@ -286,6 +349,25 @@ export default function (pi: ExtensionAPI) {
       hubBroadcast(msg, terminalName);
     } else if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
+    }
+  }
+
+  // ADR-0001: 60s unconditional heartbeat while connected. Bounds peer-cache
+  // staleness at ≤60s (idle growth via steers was previously unbounded) and
+  // doubles as a liveness signal. No overlap with the remote-prompt keepalive;
+  // they coexist, force pushes dedupe by time. Started on link up for both
+  // roles; stopped on disconnect/cleanup.
+  function startHeartbeat() {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => pushStatus(true), HEARTBEAT_INTERVAL_MS);
+    // unref so it never keeps the event loop alive on its own.
+    heartbeatTimer.unref?.();
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
     }
   }
 
@@ -338,6 +420,37 @@ export default function (pi: ExtensionAPI) {
     if (c.tokens === null) return `?/${window}`;
     const percent = Math.round((c.tokens / c.contextWindow) * 100);
     return `${formatTokens(c.tokens)}/${window} (${percent}%)`;
+  }
+
+  // ADR-0001: hotness is absolute headroom, not percent: hot ⇔
+  // contextWindow − tokens < HOT_HEADROOM_TOKENS. Percent is incomparable
+  // across window sizes. Returns false when tokens are unknown (null) —
+  // missing cache entries are omitted silently by readout callers.
+  function isHot(c: ContextSnapshot | null | undefined): boolean {
+    if (!c || c.contextWindow <= 0 || c.tokens === null) return false;
+    return c.contextWindow - c.tokens < HOT_HEADROOM_TOKENS;
+  }
+
+  // ADR-0001 decision-point readout for tool results. Full absolute form —
+  // never percent alone. Appends ` ⚠ hot` when headroom < HOT_HEADROOM_TOKENS.
+  // Returns "" when the target has no cache entry or unknown tokens (omit
+  // silently). Broadcast target ("*") never gets a readout.
+  function contextReadout(name: string): string {
+    if (name === "*") return ""; // broadcast: no readout
+    const c = getContextFor(name);
+    if (!c || c.tokens === null) return ""; // missing cache / unknown — omit
+    const base = formatContext(c);
+    return isHot(c) ? `${base} ⚠ hot` : base;
+  }
+
+  // ADR-0001 inbound-chat delivery-time hot annotation, computed at delivery
+  // time (not render time), appended into message *content*. Hot senders only.
+  // Scheduling audience is the receiving LLM, not a human watching the TUI.
+  function hotAnnotation(name: string): string {
+    const c = getContextFor(name);
+    if (!isHot(c)) return ""; // cold / unknown → no annotation
+    const headroom = c!.contextWindow - c!.tokens!;
+    return `\n[⚠ "${name}" ctx ${formatContext(c)} — headroom ${formatTokens(headroom)}, consider link_compact before dispatching]`;
   }
 
   function getStatusFor(name: string): LinkStatus | null {
@@ -408,7 +521,9 @@ export default function (pi: ExtensionAPI) {
     let totalChars = 0;
     for (let i = 0; i < inbox.length && batch.length < BATCH_MAX_ITEMS; i++) {
       const item = inbox[i];
-      const text = `From "${item.from}":\n${item.content}`;
+      // ADR-0001: hot-only annotation computed at delivery time (not render
+      // time), appended after each hot item's text into message *content*.
+      const text = `From "${item.from}":\n${item.content}${hotAnnotation(item.from)}`;
       if (batch.length > 0 && totalChars + text.length > BATCH_MAX_CHARS) break;
       batch.push(text);
       totalChars += text.length;
@@ -635,6 +750,7 @@ export default function (pi: ExtensionAPI) {
           "info",
         );
         pushStatus(true);
+        startHeartbeat();
         break;
 
       // ── Membership updates ──
@@ -699,10 +815,13 @@ export default function (pi: ExtensionAPI) {
           inbox.push({ from: msg.from, content: msg.content });
           scheduleFlush(FLUSH_DELAY_MS);
         } else {
+          // ADR-0001: hot-only annotation computed at delivery time (not
+          // render time), appended into message *content*. The scheduling
+          // audience is the receiving LLM, not a human watching the TUI.
           pi.sendMessage(
             {
               customType: "link",
-              content: msg.content,
+              content: msg.content + hotAnnotation(msg.from),
               display: true,
               details: { from: msg.from },
             },
@@ -802,7 +921,17 @@ export default function (pi: ExtensionAPI) {
               }),
             );
           } else {
-            pending.resolve(textResult(msg.response, { from: msg.from }));
+            // ADR-0001: append final-line readout of the target's context at
+            // response time (decision point). Cache freshness is guaranteed by
+            // the push-before-response ordering: peer `agent_end` pushes
+            // status before emitting `prompt_response`. Full absolute form;
+            // ` ⚠ hot` when headroom < HOT_HEADROOM_TOKENS. Omit silently when
+            // the target has no cache entry / unknown tokens.
+            const readout = contextReadout(pending.targetName);
+            const response = readout
+              ? `${msg.response}\n[${readout}]`
+              : msg.response;
+            pending.resolve(textResult(response, { from: msg.from }));
           }
         }
         break;
@@ -816,8 +945,16 @@ export default function (pi: ExtensionAPI) {
           // not_found response comes from the hub, not the worker.
           const target = pending.targetName;
           if (msg.ok) {
+            // ADR-0001: before (captured at request time) → after (from cache
+            // at response time). Missing cache / unknown tokens omit silently.
+            const before = pending.beforeReadout;
+            const after = contextReadout(target);
+            const suffix =
+              before || after
+                ? ` · ${before || "?"} → ${after || "?"}`
+                : "";
             pending.resolve(
-              textResult(`Compacted "${target}"`, { to: target }),
+              textResult(`Compacted "${target}"${suffix}`, { to: target }),
             );
           } else {
             const reason = msg.reason ?? "failed";
@@ -988,6 +1125,7 @@ export default function (pi: ExtensionAPI) {
           `Link hub started on :${DEFAULT_PORT} as "${terminalName}"`,
           "info",
         );
+        startHeartbeat();
         resolve(true);
       });
 
@@ -1049,6 +1187,7 @@ export default function (pi: ExtensionAPI) {
         if (role === "client") {
           role = "disconnected";
           connectedTerminals = [];
+          stopHeartbeat();
           updateStatus();
 
           if (!manuallyDisconnected) {
@@ -1102,6 +1241,13 @@ export default function (pi: ExtensionAPI) {
       reconnectTimer = null;
     }
 
+    // ADR-0001: stop heartbeat + debounce timer on disconnect.
+    stopHeartbeat();
+    if (statusDebounceTimer) {
+      clearTimeout(statusDebounceTimer);
+      statusDebounceTimer = null;
+    }
+
     // Clean up target-side remote prompt state
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);
@@ -1152,6 +1298,7 @@ export default function (pi: ExtensionAPI) {
     hubTerminalCwds.clear();
     lastPushedKind = null;
     lastPushedTool = null;
+    lastStatusSendAt = 0;
     updateStatus();
 
     // Inbox survives disconnect — messages are local state waiting for local delivery.
@@ -1305,6 +1452,20 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // ADR-0001: force a status push BEFORE emitting prompt_response. The
+      // non-force pushStatus() at the top of this handler may have been
+      // swallowed by the trailing-edge debounce (if <1s since the last actual
+      // send — the common case at a busy run's tail, where tool_execution_end
+      // just pushed). routeMessage(prompt_response) below fires synchronously,
+      // so without this force push the response would reach the requester
+      // before the freshest status_update, and the link_prompt readout would
+      // consume a stale cache entry (the last tool-boundary snapshot) instead
+      // of this terminal's just-settled idle state. force bypasses the
+      // debounce and cancels any pending timer, restoring the
+      // push-before-response ordering guarantee exactly where a waiter
+      // consumes it. Cost: at most one extra status_update per remote prompt.
+      pushStatus(true);
+
       routeMessage({
         type: "prompt_response",
         id,
@@ -1409,7 +1570,12 @@ export default function (pi: ExtensionAPI) {
       }
       // Hub delivery is authoritative; client delivery is optimistic (hub routes)
       const verb = role === "hub" ? "Sent to" : "Sent to hub for delivery to";
-      return textResult(`${verb} ${target}`, {
+      // ADR-0001: append target context readout (decision point). Full
+      // absolute form; ` ⚠ hot` when headroom < HOT_HEADROOM_TOKENS.
+      // Broadcast ("*") gets no readout; missing cache / unknown tokens omit.
+      const readout = contextReadout(params.to);
+      const suffix = readout ? ` · ${readout}` : "";
+      return textResult(`${verb} ${target}${suffix}`, {
         to: params.to,
         triggerTurn: params.triggerTurn ?? false,
       });
@@ -1488,6 +1654,10 @@ export default function (pi: ExtensionAPI) {
           resolve,
           targetName: params.to,
           timeout,
+          // ADR-0001: capture target readout at request time (decision point).
+          // Empty when the target has no cache entry / unknown tokens — then
+          // the success result just omits the before→after suffix.
+          beforeReadout: contextReadout(params.to),
         });
 
         signal?.addEventListener(

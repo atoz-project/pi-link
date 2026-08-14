@@ -463,6 +463,27 @@ When the hub goes down and a client promotes itself, terminal names and in-fligh
 | 7   | **Single-machine / localhost-only**       | Link only binds to `127.0.0.1`; terminals on different machines cannot join.                                                                                                                                    |
 | 8   | **Rename during prompt loses keepalives** | If the target renames mid-prompt, keepalive resets stop working (pending requests track by name). The final response can still succeed by request ID, but inactivity may false-fire on long tasks after rename. |
 
+### Status channel event model (ADR-0001)
+
+The status channel reshapes its send-side event model and consumes the existing peer context cache at every decision point, **without changing the wire protocol**. Three constants govern it:
+
+| Constant                | Value  | Role                                                                                                                                                                                |
+| ----------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `STATUS_DEBOUNCE_MS`    | 1,000  | Trailing-edge debounce window on `status_update` sends. Intermediate states are dropped (status is absolute, not incremental); the latest derived state is sent at the window edge. `force` pushes bypass. |
+| `HEARTBEAT_INTERVAL_MS` | 60,000 | Unconditional heartbeat while connected. Bounds peer-cache staleness at ≤60s (idle growth via steered messages was previously unbounded) and doubles as a liveness signal. Runs in both roles. |
+| `HOT_HEADROOM_TOKENS`   | 100,000 | Hot-terminal threshold: hot ⇔ `contextWindow − tokens < HOT_HEADROOM_TOKENS` (absolute headroom, not percent — percent is incomparable across window sizes, and Pi's own auto-compaction triggers on an absolute reserve). A knob is deliberately deferred until a real small-window user or upstream review demands it. |
+
+**Decision-point readouts** (full absolute form `tokens/window (percent%)`, never percent alone):
+
+- `link_send` success appends `· <readout>` (` ⚠ hot` when hot); broadcast (`to:"*"`) gets no readout.
+- `link_prompt` result appends a final `[<readout>]` line. Cache freshness is guaranteed by the push-before-response ordering: `agent_end` calls `pushStatus(true)` (force, bypassing debounce) immediately before emitting `prompt_response`, so the freshest `status_update` always precedes the response even at a busy run's tail where the handler's non-force push is debounce-swallowed.
+- `link_compact` success shows `before → after`.
+- Missing cache entries / `tokens: null` omit silently.
+
+**Inbound chat hot annotation** — both delivery paths (steer and batched flush) append a `[⚠ "from" ctx … — headroom …, consider link_compact before dispatching]` line into message *content* for hot senders only, computed at delivery time (not render time). The scheduling audience is the receiving LLM.
+
+The hub stays a dumb fan-out: no subscriptions, no broker, no per-client filtering. Busy-terminal event rate is capped at ~1 msg/s (was several per tool boundary); idle terminals emit 1/60s (net new, negligible). See `docs/adr/0001-status-channel-event-model.md`.
+
 ---
 
 ## Dependencies
