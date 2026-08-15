@@ -44,3 +44,16 @@ _Avoid_: overloaded, full, high percentage
 **Fan-out**:
 The hub's 1→(N−1) re-broadcast of a status channel message. Hub serializes
 once and writes each client socket; cost scales with event rate × N.
+
+**Profile**:
+A named fleet connection config in `~/.pi/agent/pi-link.json` (mode 0600):
+hub URL + the fleet's shared token. A terminal selects one at spawn
+(`PI_LINK_PROFILE` > URL match > `default`); no profile means loopback-only,
+unauthenticated, pre-ADR-0002 behavior.
+_Avoid_: account, credential
+
+**Trust domain**:
+One link/fleet. Membership confers full power over every member (a prompt
+executes a full agent turn with tools). Exactly one shared token per domain;
+no finer-grained authorization exists by design (ADR-0002).
+_Avoid_: tenant, scope
