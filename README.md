@@ -220,6 +220,51 @@ Resume: pi-link <name>
 
 For scripting, `pi-link --resolve <name>` prints just the session path (machine-readable, no other output). Exit codes: `0` on single match, `1` if ambiguous (multiple matches printed to stderr), `2` if not found.
 
+### Public-reachable hub (ADR-0002)
+
+By default the hub binds `127.0.0.1:9900` (loopback, unauthenticated). To span machines where SSH/Tailscale tunnels are impractical, pi-link can bind a non-loopback address and authenticate clients with a shared token. **Link membership is RCE-equivalent** (`link_prompt`/`link_send triggerTurn:true` run a full agent turn with tools), so non-loopback binds require authn and transport encryption.
+
+**Config env** (non-secret endpoint config):
+
+| Env | Role | Default |
+| --- | --- | --- |
+| `PI_LINK_HOST` | hub bind host | `127.0.0.1` |
+| `PI_LINK_URL` | client hub URL (`ws://` or `wss://`) | `ws://127.0.0.1:9900` |
+| `PI_LINK_PROFILE` | explicit profile selection | unset |
+
+**Profiles file** `~/.pi/agent/pi-link.json` (mode `0600`) — the **only** token source (env vars are visible in `ps`; user ruling). Shape:
+
+```json
+{
+  "profiles": {
+    "fleet": { "url": "wss://hub.example:9900", "token": "<shared-secret>" }
+  },
+  "default": "fleet"
+}
+```
+
+Selection: `PI_LINK_PROFILE` > profile whose `url` matches `PI_LINK_URL` > `default` > none. `none` (loopback, no profile) is byte-identical to pre-ADR-0002 behavior — opt-in, upstream-friendly.
+
+**Fail-closed.** A non-loopback bind (`PI_LINK_HOST` not in `127.0.0.1`/`localhost`/`::1`; `127.0.0.2` counts as non-loopback) without a resolvable token refuses to start with an explicit reason — an unauthenticated public bind is not an allowed state.
+
+**Hub auth.** With a token resolved, `register` is verified via `sha256(token)` digests compared with `crypto.timingSafeEqual` (digest both sides — equalizes length; the token itself is never logged). Mismatch/missing → hub replies an error, closes the socket, and notifies locally with the source address. Loopback clients authenticate too (one code path).
+
+**Auth rejection vs hub loss.** The client sets an `authFailed` flag on rejection and **stops** auto-reconnect (a wrong-token terminal would otherwise hammer the hub every 2s), notifying clearly and pointing at the profiles file; `/link-connect` resets it. Hub loss keeps today's retry-with-backoff.
+
+**No cross-machine promotion (B6).** A client whose URL is non-loopback never runs `startHub` — hub loss means reconnect-with-backoff only. Otherwise one outage splits the fleet into per-machine islands that all look healthy.
+
+**Transport encryption.** TLS termination belongs to the deployment edge (certificate lifecycle does not belong in a single-file extension). `PI_LINK_URL` accepts `wss://` natively (Node's ws client speaks TLS). Sending a token over plaintext `ws://` to a non-loopback host produces one warning per session but is not blocked — policy belongs to operators, mechanism to code.
+
+Minimal reverse-proxy TLS SOP (caddy):
+
+```
+caddy reverse-proxy --from hub.example:9900 --to 127.0.0.1:9900
+```
+
+With cloudflared: publish the local `9900` port through a named tunnel and point `PI_LINK_URL` at the tunnel's `wss://` hostname.
+
+**Mixed-version rule.** `register` carries an optional `token` field (old hubs ignore unknown fields). Upgrade all terminals before enabling auth so a mix of old (unauthenticated) and new (token-expected) hubs doesn't fragment the fleet.
+
 ---
 
 ## LLM Tools

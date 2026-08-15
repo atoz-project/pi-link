@@ -43,6 +43,16 @@ const BATCH_MAX_CHARS = 16_000;
 const STATUS_DEBOUNCE_MS = 1_000;
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const HOT_HEADROOM_TOKENS = 100_000;
+// ADR-0002 public-reachable hub auth. Loopback host set (host not in it
+// = non-loopback). Deliberately conservative: 127.0.0.2 counts as non-loopback,
+// which also makes the fail-closed / no-self-promotion guards testable without
+// a real external interface. Profiles file is the only token source
+// (~/.pi/agent/pi-link.json, mode 0600); no env-var token override.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const PROFILES_FILE_PATH = (() => {
+  const home = os.homedir().replace(/\\/g, "/");
+  return `${home}/.pi/agent/pi-link.json`;
+})();
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -51,6 +61,10 @@ interface RegisterMsg {
   name: string;
   cwd?: string;
   context?: ContextSnapshot;
+  // ADR-0002: optional shared-token auth. Present when the client resolved a
+  // profile token; absent otherwise. Old hubs ignore unknown fields
+  // (fork-first, upstream PR later).
+  token?: string;
 }
 interface WelcomeMsg {
   type: "welcome";
@@ -169,8 +183,21 @@ export default function (pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
   let disposed = false;
   let manuallyDisconnected = false;
+  // ADR-0002: set when the hub rejected our token (error-before-close). Stops
+  // auto-reconnect (a wrong-token terminal would hammer the hub every 2s) and
+  // is cleared by manual /link-connect. Distinguishes auth rejection from
+  // hub loss (which keeps backoff retry).
+  let authFailed = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let startupConnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // ADR-0002: resolved link config (URL + token), cached on first
+  // connect/startHub. null = not yet resolved. Token is the fleet shared
+  // secret from the profiles file; never logged.
+  let resolvedHubUrl: string | null = null;
+  let resolvedToken: string | null = null;
+  // Whether the plaintext-warning has fired this session (ADR-0002 §1:
+  // exactly once per session, not per reconnect).
+  let plaintextWarningFired = false;
 
   // Status tracking (local truth)
   let agentRunning = false;
@@ -281,6 +308,120 @@ export default function (pi: ExtensionAPI) {
       return { kind: "tool", toolName: activeToolName, since: stateSince };
     if (agentRunning) return { kind: "thinking", since: stateSince };
     return { kind: "idle", since: stateSince };
+  }
+
+  // ── ADR-0002 config resolution ────────────────────────────────────────
+  //
+  // Three env + one profiles file (~/.pi/agent/pi-link.json, 0600). The file
+  // is the ONLY token source (user ruling: no env-var token override — env
+  // is visible in ps). Selection chain:
+  //   PI_LINK_PROFILE > profile whose url matches PI_LINK_URL > default > none
+  // none (loopback, no token) = byte-identical to pre-ADR-0002 behavior.
+
+  interface ProfileEntry {
+    url?: string;
+    token?: string;
+  }
+  interface ProfilesFile {
+    profiles?: Record<string, ProfileEntry>;
+    default?: string;
+  }
+
+  function loadProfilesFile(): ProfilesFile | null {
+    try {
+      const fs = require("node:fs");
+      if (!fs.existsSync(PROFILES_FILE_PATH)) return null;
+      const raw = fs.readFileSync(PROFILES_FILE_PATH, "utf8");
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        (parsed.profiles === undefined ||
+          (typeof parsed.profiles === "object" && parsed.profiles !== null))
+      )
+        return parsed as ProfilesFile;
+      return null;
+    } catch {
+      return null; // malformed/unreadable → treat as no profiles
+    }
+  }
+
+  // Host of a ws/wss URL, or null if unparseable. "localhost"/"127.0.0.1"/"::1"
+  // are loopback; everything else (incl. 127.0.0.2) is non-loopback.
+  function urlHost(url: string): string | null {
+    // Accept "host:port", "ws://host:port", "wss://host:port/path".
+    try {
+      const u = new URL(url);
+      return u.hostname;
+    } catch {
+      // bare host:port or host
+      const m = url.match(/^([^/:]+)(?::\d+)?$/);
+      return m ? m[1] : null;
+    }
+  }
+
+  function isLoopbackHost(host: string): boolean {
+    return LOOPBACK_HOSTS.has(host);
+  }
+
+  // Resolve the effective hub URL for THIS terminal (client path).
+  // PI_LINK_URL env, else default ws://127.0.0.1:9900 (today's behavior).
+  function resolveHubUrl(): string {
+    return process.env.PI_LINK_URL || `ws://127.0.0.1:${DEFAULT_PORT}`;
+  }
+
+  // Resolve hub bind host (hub path). PI_LINK_HOST env, else 127.0.0.1.
+  function resolveHubHost(): string {
+    return process.env.PI_LINK_HOST || "127.0.0.1";
+  }
+
+  // Resolve the token + profile-selected URL for THIS terminal as a client.
+  // Returns { url, token } where token is null when no profile resolves
+  // (loopback default = unauthenticated). Never throws.
+  function resolveClientConfig(): { url: string; token: string | null } {
+    const envUrl = process.env.PI_LINK_URL;
+    const envProfile = process.env.PI_LINK_PROFILE;
+    const profiles = loadProfilesFile();
+    const url = resolveHubUrl();
+
+    let chosen: ProfileEntry | undefined;
+    // 1. PI_LINK_PROFILE explicit
+    if (envProfile && profiles?.profiles?.[envProfile])
+      chosen = profiles.profiles[envProfile];
+    // 2. profile whose url matches PI_LINK_URL
+    if (!chosen && envUrl && profiles?.profiles) {
+      for (const [, p] of Object.entries(profiles.profiles)) {
+        if (p.url && urlHost(p.url) === urlHost(envUrl) && p.url === envUrl)
+          chosen = p;
+      }
+    }
+    // 3. default
+    if (!chosen && profiles?.default && profiles.profiles?.[profiles.default])
+      chosen = profiles.profiles[profiles.default];
+
+    const token = chosen?.token ?? null;
+    return { url, token };
+  }
+
+  // Resolve the token for the hub (this machine binds). Used for fail-closed
+  // check + register verification. Token from profiles file only; env override
+  // deliberately absent (user ruling). Returns null when no profile resolves.
+  function resolveHubToken(): string | null {
+    const profiles = loadProfilesFile();
+    const envProfile = process.env.PI_LINK_PROFILE;
+    let chosen: ProfileEntry | undefined;
+    if (envProfile && profiles?.profiles?.[envProfile])
+      chosen = profiles.profiles[envProfile];
+    if (!chosen && profiles?.default && profiles.profiles?.[profiles.default])
+      chosen = profiles.profiles[profiles.default];
+    return chosen?.token ?? null;
+  }
+
+  // sha256 digest of a token, as a 32-byte Buffer. Used for timing-safe
+  // compare (equalizes length — a raw timingSafeEqual on unequal-length
+  // inputs throws, and comparing pre-hashes avoids length-leak).
+  function tokenDigest(token: string): Buffer {
+    return crypto.createHash("sha256").update(token, "utf8").digest();
   }
 
   function captureContext(): ContextSnapshot | undefined {
@@ -971,6 +1112,12 @@ export default function (pi: ExtensionAPI) {
 
       case "error":
         notify(`Link: ${msg.message}`, "error");
+        // ADR-0002: hub sends an auth-rejection error before closing on
+        // bad/missing token. Flag it so the close handler stops auto-reconnect
+        // (auth rejection ≠ hub loss).
+        if (/auth rejected/i.test(msg.message)) {
+          authFailed = true;
+        }
         break;
     }
   }
@@ -988,6 +1135,45 @@ export default function (pi: ExtensionAPI) {
       // First message must be register
       if (msg.type === "register") {
         if (clientName) return; // already registered — ignore duplicate
+
+        // ADR-0002: uniform auth when the hub has a token (resolved in
+        // startHub). Loopback clients also authenticate — one code path,
+        // local terminals read the same profiles file. Verify BEFORE
+        // welcome/joined broadcast so an unauthenticated client never learns
+        // fleet state. Compare sha256 digests via timingSafeEqual (equalizes
+        // length; never log the token itself).
+        if (resolvedToken) {
+          const clientToken = msg.token;
+          let authorized = false;
+          if (clientToken) {
+            const a = tokenDigest(clientToken);
+            const b = tokenDigest(resolvedToken);
+            authorized =
+              a.length === b.length &&
+              crypto.timingSafeEqual(a, b);
+          }
+          if (!authorized) {
+            const remote =
+              (clientWs as any & { _socket?: { remoteAddress?: string } })
+                ?._socket?.remoteAddress ?? "unknown";
+            const reason = clientToken
+              ? "token mismatch"
+              : "missing token";
+            clientWs.send(
+              JSON.stringify({
+                type: "error",
+                message: `Link auth rejected: ${reason}`,
+              } satisfies ErrorMsg),
+            );
+            notify(
+              `Rejected link register from ${remote} (${reason})`,
+              "error",
+            );
+            clientWs.close();
+            return;
+          }
+        }
+
         clientName = uniqueName(msg.name);
         hubClients.set(clientWs, clientName);
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
@@ -1100,9 +1286,31 @@ export default function (pi: ExtensionAPI) {
 
   function startHub(): Promise<boolean> {
     return new Promise((resolve) => {
+      const bindHost = resolveHubHost();
+      // ADR-0002 fail-closed: non-loopback bind without a resolvable token
+      // → refuse to start. Link membership is RCE-equivalent; an unauthenticated
+      // public bind is not an allowed state. Explicit reason; do not bind.
+      if (!isLoopbackHost(bindHost)) {
+        const token = resolveHubToken();
+        if (!token) {
+          const reason = `Refusing to start hub on non-loopback ${bindHost}:${DEFAULT_PORT} — no token resolvable in ${PROFILES_FILE_PATH}. Set a profile token before exposing the hub.`;
+          console.error(`Link: ${reason}`);
+          notify(reason, "error");
+          resolve(false);
+          return;
+        }
+        // Cache the resolved token for register verification.
+        resolvedToken = token;
+      } else {
+        // Loopback: cache token if a profile resolves one (uniform auth —
+        // loopback clients also authenticate when the hub has a token, one code
+        // path). Null = unauthenticated loopback (today's behavior).
+        resolvedToken = resolveHubToken();
+      }
+
       const server = new WebSocketServer({
         port: DEFAULT_PORT,
-        host: "127.0.0.1",
+        host: bindHost,
       });
 
       server.on("listening", () => {
@@ -1121,8 +1329,9 @@ export default function (pi: ExtensionAPI) {
         role = "hub";
         connectedTerminals = [terminalName];
         updateStatus();
+        const authSuffix = resolvedToken ? " (auth: token required)" : "";
         notify(
-          `Link hub started on :${DEFAULT_PORT} as "${terminalName}"`,
+          `Link hub started on ${bindHost}:${DEFAULT_PORT} as "${terminalName}"${authSuffix}`,
           "info",
         );
         startHeartbeat();
@@ -1148,7 +1357,30 @@ export default function (pi: ExtensionAPI) {
 
   function connectAsClient(): Promise<boolean> {
     return new Promise((resolve) => {
-      const socket = new WebSocket(`ws://127.0.0.1:${DEFAULT_PORT}`);
+      // ADR-0002: connect to the resolved hub URL (ws:// or wss:// — the ws
+      // library speaks TLS natively). Token from profiles file only.
+      const { url, token } = resolveClientConfig();
+      resolvedHubUrl = url;
+      resolvedToken = token;
+      const host = urlHost(url);
+      const nonLoopback = host ? !isLoopbackHost(host) : false;
+      // Plaintext + token to non-loopback → one loud warning per session
+      // (ADR-0002 §1: policy belongs to operators, mechanism to code; not
+      // blocked). Fires exactly once (plaintextWarningFired guards reconnects).
+      if (
+        nonLoopback &&
+        token &&
+        url.startsWith("ws://") &&
+        !plaintextWarningFired
+      ) {
+        plaintextWarningFired = true;
+        notify(
+          `Link: sending token over plaintext ws:// to non-loopback ${host} (profile token visible on the wire). Configure wss:// or a TLS-terminating reverse proxy.`,
+          "warning",
+        );
+      }
+
+      const socket = new WebSocket(url);
       let resolved = false;
 
       socket.on("open", () => {
@@ -1163,13 +1395,16 @@ export default function (pi: ExtensionAPI) {
         ws = socket;
         role = "client";
         resolved = true;
-        // Register with preferred name if available, otherwise current name
+        // Register with preferred name if available, otherwise current name.
+        // ADR-0002: include token when resolved (present = auth; absent =
+        // old-hub-compatible unauthenticated). Never log the token.
         socket.send(
           JSON.stringify({
             type: "register",
             name: preferredName ?? terminalName,
             cwd: currentCwd || undefined,
             context: captureContext(),
+            ...(token ? { token } : {}),
           } satisfies RegisterMsg),
         );
         resolve(true);
@@ -1190,7 +1425,18 @@ export default function (pi: ExtensionAPI) {
           stopHeartbeat();
           updateStatus();
 
-          if (!manuallyDisconnected) {
+          // ADR-0002: distinguish auth rejection from hub loss. authFailed is
+          // set in handleIncoming("error") when the hub sent an auth-rejection
+          // error before closing. Rejection stops auto-reconnect (a wrong-token
+          // terminal would hammer the hub every 2s); clear, actionable notify
+          // pointing at the profiles file. Manual /link-connect resets it.
+          // Hub loss keeps today's retry-with-backoff.
+          if (authFailed) {
+            notify(
+              `Link auth rejected by hub (token mismatch or missing). Auto-reconnect stopped. Check ${PROFILES_FILE_PATH}, then /link-connect.`,
+              "error",
+            );
+          } else if (!manuallyDisconnected) {
             notify("Disconnected from link hub", "warning");
             scheduleReconnect();
           }
@@ -1215,10 +1461,24 @@ export default function (pi: ExtensionAPI) {
     // Try connecting to an existing hub
     if (await connectAsClient()) return;
 
-    // No hub found — become the hub
-    if (await startHub()) return;
+    // ADR-0002 B6: a client whose resolved URL is non-loopback never runs
+    // startHub — otherwise one hub outage splits the fleet into per-machine
+    // islands that all look healthy. Hub loss means reconnect-with-backoff
+    // only. Terminals local to the hub machine (loopback URL) keep today's
+    // promotion. authFailed never self-promotes either (the rejection was
+    // for THIS terminal's token; promoting would bind a hub the same token
+    // can't satisfy — and the user must intervene).
+    const hubHost = resolvedHubUrl ? urlHost(resolvedHubUrl) : null;
+    const nonLoopback = hubHost ? !isLoopbackHost(hubHost) : false;
+    if (!nonLoopback && !authFailed) {
+      if (await startHub()) return;
+    }
 
-    // Port busy but couldn't connect (rare race). Retry after delay.
+    // Hub not reachable and we cannot (or must not) promote. Retry after delay.
+    if (authFailed) {
+      // Auth rejection: do not schedule reconnect (stops the hammer).
+      return;
+    }
     scheduleReconnect();
   }
 
@@ -1299,6 +1559,12 @@ export default function (pi: ExtensionAPI) {
     lastPushedKind = null;
     lastPushedTool = null;
     lastStatusSendAt = 0;
+    // ADR-0002: clear resolved client/hub token on disconnect so a fresh
+    // connect re-reads the profiles file (token may have been rotated).
+    // authFailed is intentionally preserved across disconnect (a rejection
+    // means the user must fix the token); only /link-connect clears it.
+    resolvedHubUrl = null;
+    resolvedToken = null;
     updateStatus();
 
     // Inbox survives disconnect — messages are local state waiting for local delivery.
@@ -2098,6 +2364,11 @@ export default function (pi: ExtensionAPI) {
       }
       pi.appendEntry("link-active", { active: true });
       manuallyDisconnected = false;
+      // ADR-0002: manual /link-connect resets the auth-rejection flag —
+      // the user has decided to retry (likely after fixing the token).
+      authFailed = false;
+      // Reset plaintext-warning so a new manual connect can re-fire it.
+      plaintextWarningFired = false;
       await initialize();
     },
   });
