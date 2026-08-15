@@ -245,9 +245,9 @@ Send a fire-and-forget chat message to a specific terminal or broadcast to all.
 | ------------- | --------- | ---------------------------------------------------- |
 | `to`          | `string`  | Target terminal name, or `"*"` for broadcast         |
 | `message`     | `string`  | Message content                                      |
-| `triggerTurn` | `boolean` | If `true`, the receiver's LLM responds automatically |
+| `triggerTurn` | `boolean` | **Required.** `true` wakes the receiver's LLM; `false` delivers passively (busy = steered into the live run; idle = stored, not processed) |
 
-When `triggerTurn` is enabled, the message is queued in the receiver's local inbox. Nearby arrivals are coalesced (200ms debounce), and delivery is gated on the receiving agent being idle - ensuring it starts a clean new turn. Messages arrive as a single `[Link: N message(s) received]` block at the top of a fresh turn, not mid-run. When `triggerTurn` is `false` or omitted, delivery is immediate fire-and-forget.
+When `triggerTurn` is `true`, the message is queued in the receiver's local inbox. Nearby arrivals are coalesced (200ms debounce), and delivery is gated on the receiving agent being idle - ensuring it starts a clean new turn. Messages arrive as a single `[Link: N message(s) received]` block at the top of a fresh turn, not mid-run. When `triggerTurn` is `false`, delivery is immediate fire-and-forget: the message is steered into the receiver's live run if it is busy, or stored in its session but **not processed** if it is idle — an idle-target warning (` ⚠ "x" is idle — message stored, not processed; resend with triggerTurn:true or use link_prompt`) is appended to the tool result in that case so the sender knows the dispatch may rot. `triggerTurn` is required (no default); omitting it yields a tool-validation error so the sender must choose per message.
 
 Note: `triggerTurn` does **not** cause the response to come back to the caller - use `link_prompt` for that.
 

@@ -1521,7 +1521,7 @@ export default function (pi: ExtensionAPI) {
     label: "Link Send",
     description: [
       "Send a message to another Pi terminal on the link.",
-      'Use to:"*" for broadcast. Set triggerTurn:true to make the receiving terminal\'s LLM respond.',
+      'Use to:"*" for broadcast. triggerTurn is required: true wakes the receiver\'s LLM (use to dispatch work); false delivers passively — into the live run if the receiver is busy, or stored-but-not-processed if it is idle (use link_prompt for a guaranteed response, or resend with triggerTurn:true once it wakes).',
     ].join(" "),
     promptSnippet:
       "Send a message to another Pi terminal on the local link network",
@@ -1530,12 +1530,14 @@ export default function (pi: ExtensionAPI) {
         description: 'Target terminal name, or "*" for broadcast',
       }),
       message: Type.String({ description: "Message content" }),
-      triggerTurn: Type.Optional(
-        Type.Boolean({
-          description:
-            "Whether to trigger an LLM turn on the receiver (default: false)",
-        }),
-      ),
+      // ADR-0003: required (no default). The old default:false silently
+      // dropped dispatches to idle receivers (steer lands in the session
+      // without waking the LLM). Sender must choose per message; LLM
+      // callers self-heal via tool-validation error + retry.
+      triggerTurn: Type.Boolean({
+        description:
+          "true wakes the receiver's LLM; false delivers passively (busy = steered into the live run; idle = stored, not processed).",
+      }),
     }),
 
     async execute(_toolCallId, params) {
@@ -1558,7 +1560,7 @@ export default function (pi: ExtensionAPI) {
         from: terminalName,
         to: params.to,
         content: params.message,
-        triggerTurn: params.triggerTurn ?? false,
+        triggerTurn: params.triggerTurn,
       });
 
       const target = params.to === "*" ? "all terminals" : `"${params.to}"`;
@@ -1574,10 +1576,24 @@ export default function (pi: ExtensionAPI) {
       // absolute form; ` ⚠ hot` when headroom < HOT_HEADROOM_TOKENS.
       // Broadcast ("*") gets no readout; missing cache / unknown tokens omit.
       const readout = contextReadout(params.to);
-      const suffix = readout ? ` · ${readout}` : "";
-      return textResult(`${verb} ${target}${suffix}`, {
+      // ADR-0003: idle-target warning on a successful direct send with
+      // triggerTurn:false. A passive send to an idle receiver is stored but
+      // not processed (steer lands in the session without waking the LLM);
+      // the warning tells the sender the dispatch may rot. Busy (thinking/tool)
+      // or unknown status → no warning (steer into a live run is fine).
+      // Broadcast excluded — passive FYI is its designed semantics.
+      let idleWarning = "";
+      if (params.to !== "*" && !params.triggerTurn) {
+        const st = getStatusFor(params.to);
+        if (st?.kind === "idle") {
+          idleWarning = ` ⚠ "${params.to}" is idle — message stored, not processed; resend with triggerTurn:true or use link_prompt`;
+        }
+      }
+      const suffix = [readout, idleWarning].filter(Boolean).join(" ");
+      const suffixStr = suffix ? ` · ${suffix}` : "";
+      return textResult(`${verb} ${target}${suffixStr}`, {
         to: params.to,
-        triggerTurn: params.triggerTurn ?? false,
+        triggerTurn: params.triggerTurn,
       });
     },
 
