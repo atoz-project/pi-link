@@ -230,6 +230,7 @@ By default the hub binds `127.0.0.1:9900` (loopback, unauthenticated). To span m
 | --- | --- | --- |
 | `PI_LINK_HOST` | hub bind host | `127.0.0.1` |
 | `PI_LINK_URL` | client hub URL (`ws://` or `wss://`) | `ws://127.0.0.1:9900` |
+| `PI_LINK_PORT` | hub bind port + default client URL port (test/fleet isolation) | `9900` |
 | `PI_LINK_PROFILE` | explicit profile selection | unset |
 
 **Profiles file** `~/.pi/agent/pi-link.json` (mode `0600`) — the **only** token source (env vars are visible in `ps`; user ruling). Shape:
@@ -287,9 +288,21 @@ Names are normalized like link names. The workspace is never derived from the cw
 
 ---
 
+### Status channel v2: budget, model label, idle-since, version gate (ADR-0005/0006)
+
+**Protocol version gate.** `LINK_PROTOCOL_VERSION` rides `register` and is echoed in `welcome`; a missing or mismatched version on either side refuses membership loudly and stops auto-reconnect (`/link-connect` retries). There are no mixed-version code paths — **the fleet upgrades together**.
+
+**Context budget — one axis.** Over budget ⇔ `tokens ≥ budget`, an absolute used-tokens ceiling. Undeclared budgets default to `contextWindow − 100K` (exactly the retired "hot terminal" semantics — the hot vocabulary is gone). Resolution mirrors link-name: `pi --link-budget 56k` > `PI_LINK_BUDGET` env (consumed once) > saved `link-budget` session entry > default. Runtime-mutable on any visible terminal via the `link_budget` tool; an optional per-dispatch `budget` on `link_send`/`link_prompt` overrides it for one exchange (a mismatch notice shows both values). Reminders are **sender-side only and blunt** — `⚠ "x" over budget: 61K/56K — decide whether to link_compact (or link_new)` — on send/prompt/compact/new results, the prompt response readout, and a `link_list` marker. Nothing is injected into the receiver's context; no auto-compact, no dispatch block.
+
+**Model label.** Every terminal reports its raw `provider/model-id:thinkingLevel` (mid-session changes re-push), shown in `link_list`. **Idle-since.** The hub tracks when each terminal went idle (hub clock, so it's cross-machine correct), shown as idle duration in `link_list` — the retirement mechanism's data source.
+
+**`link_new` (ADR-0006).** The third lifecycle op over the link: start a brand-new session in place. The target acks first (carrying its `oldSessionId` — pi never deletes session files), then pre-writes its link-name/workspace/budget into the new session and rejoins under the same name. Completion = watching it leave and rejoin.
+
+---
+
 ## LLM Tools
 
-The extension registers four tools that the LLM can invoke during agent runs. pi-link also ships with a bundled **pi-link-coordination** skill that gives agents on-demand guidance for tool selection, delegation patterns, and avoiding common coordination mistakes.
+The extension registers six tools that the LLM can invoke during agent runs. pi-link also ships with a bundled **pi-link-coordination** skill that gives agents on-demand guidance for tool selection, delegation patterns, and avoiding common coordination mistakes.
 
 ### Which tool should I use?
 
@@ -299,6 +312,8 @@ The extension registers four tools that the LLM can invoke during agent runs. pi
 | `link_prompt`  | Run a prompt on a remote terminal and wait for reply | The remote terminal's assistant response            |
 | `link_list`    | List currently connected terminals                   | Terminal list with roles, status, cwd, and context  |
 | `link_compact` | Ask another terminal to compact its context window   | Waits for completion; returns compacted or an error |
+| `link_budget`  | Set a terminal's declared context budget             | Ack (✓/✗); target persists + re-announces           |
+| `link_new`     | Start a brand-new session on a terminal, in place    | Ack with old session id; target leaves and rejoins  |
 
 **If you need the other terminal's answer back, use `link_prompt`.** Use `link_send` to notify or steer without waiting.
 
@@ -355,7 +370,9 @@ Each terminal's status is derived automatically from Pi lifecycle events - agent
 | `thinking (3s)`   | LLM is generating       |
 | `tool:bash (12s)` | Running a specific tool |
 
-Durations are computed at render time from a `since` timestamp - no timer traffic over the wire. Terminals that just joined with no status data yet render as blank, not fake idle.
+Durations are computed at render time from a `since` timestamp - no timer traffic over the wire. For peers, idle duration prefers the hub-authoritative idle-since clock (cross-machine correct; ADR-0005). Terminals that just joined with no status data yet render as blank, not fake idle.
+
+Each line also shows the terminal's **model label** (`provider/model-id:thinkingLevel`, ADR-0005) and, when the terminal's used tokens reach its context budget, a **`⚠ over budget`** marker with the blunt reminder (see Status channel v2 above).
 
 Working directories use full absolute paths in tool output. In the TUI (`/link`), paths are shortened to `~/...` when possible to keep the display compact.
 
@@ -389,9 +406,35 @@ Ask another terminal to compact its context window and **wait** until it finishe
 - Targets **one terminal at a time** (no broadcast mode). To compact several workers concurrently, issue parallel tool calls.
 - **No consent or capability gate** — any connected terminal can request compaction on any other; link participants are cooperating peers.
 
+### `link_budget`
+
+Set a terminal's declared context budget (ADR-0005) — the one compaction-decision axis: over budget ⇔ `tokens ≥ budget`.
+
+| Parameter | Type              | Description                                                                                          |
+| --------- | ----------------- | ---------------------------------------------------------------------------------------------------- |
+| `to`      | `string`          | Target terminal name (self allowed)                                                                  |
+| `budget`  | `number \| "off"` | Absolute used-tokens ceiling (e.g. `56000`), or `"off"` to clear back to the default (`contextWindow − 100K`) |
+
+- The target updates its declared budget, **persists it to the session** (survives restart), pushes an immediate status update so peers see the new value, and acks ✓.
+- ✗ on `not_found` (including cross-workspace targets — visible-set addressing applies).
+- No extra authorization — link membership is already full power (ADR-0002). Budget is a threshold, not a membership invariant, so runtime mutation is safe (contrast workspace, fixed for life).
+
+### `link_new`
+
+Ask another terminal to **start a brand-new session in place** (ADR-0006) — fresh context without process churn. History stays resumable on disk; pi never deletes session files.
+
+| Parameter | Type     | Description          |
+| --------- | -------- | -------------------- |
+| `to`      | `string` | Target terminal name |
+
+- **Ack-before-teardown** — the target acks first, carrying its `oldSessionId` (resurrection metadata; fleet convention: record it on the work ticket), because session replacement kills the responder's socket mid-flight.
+- **Identity carries** — link-name, workspace, declared budget, and connect intent are pre-written into the new session, so the new instance rejoins under the same name in the same workspace. No rename-at-new (`/link-name`'s job), no seed prompt (wait for the rejoin, then `link_prompt`).
+- **Completion** = observing `terminal_left` → `terminal_joined` for the same name.
+- **Busy decline** — mid-turn, pending remote prompt, or compacting → `reason: "busy"`; retry when idle. Self-target rejection points at `/new`.
+
 ### Coordination recipes
 
-The four tools compose into coordination shapes worth naming:
+The six tools compose into coordination shapes worth naming:
 
 - **Fan-out** - split independent subtasks across several terminals with `link_send(triggerTurn: true)`, keep working, then synthesize the callbacks. Parallelizes work that doesn't share a sequence. If a worker's context (visible in `link_list`) runs high, `link_compact` trims it and returns when the worker is idle — feed it the next subtask immediately.
 - **Adversarial review** - have one terminal produce or edit work, then `link_prompt` another to critique it. Because `link_prompt` blocks on a reply from a separate session, the critique lands in the same turn; feed it back or revise locally.
@@ -491,7 +534,7 @@ There is **no explicit leader election** - promotion is race-based.
 
 ### Port 9900 is already in use
 
-If another process occupies port 9900, the terminal can't become the hub. It will attempt to connect as a client instead (which also fails if there's no real hub), then retry after 2-5 seconds. Free the port or modify `DEFAULT_PORT` in `index.ts` - see [Limitations](#limitations--design-decisions).
+If another process occupies port 9900, the terminal can't become the hub. It will attempt to connect as a client instead (which also fails if there's no real hub), then retry after 2-5 seconds. Free the port, or set `PI_LINK_PORT` to run an isolated fleet on another port - see [Limitations](#limitations--design-decisions).
 
 ### "Terminal is busy" rejections
 
@@ -536,18 +579,19 @@ The status channel reshapes its send-side event model and consumes the existing 
 | ----------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `STATUS_DEBOUNCE_MS`    | 1,000  | Trailing-edge debounce window on `status_update` sends. Intermediate states are dropped (status is absolute, not incremental); the latest derived state is sent at the window edge. `force` pushes bypass. |
 | `HEARTBEAT_INTERVAL_MS` | 60,000 | Unconditional heartbeat while connected. Bounds peer-cache staleness at ≤60s (idle growth via steered messages was previously unbounded) and doubles as a liveness signal. Runs in both roles. |
-| `HOT_HEADROOM_TOKENS`   | 100,000 | Hot-terminal threshold: hot ⇔ `contextWindow − tokens < HOT_HEADROOM_TOKENS` (absolute headroom, not percent — percent is incomparable across window sizes, and Pi's own auto-compaction triggers on an absolute reserve). A knob is deliberately deferred until a real small-window user or upstream review demands it. |
+| `DEFAULT_BUDGET_RESERVE` | 100,000 | ADR-0005: default-budget reserve — an undeclared context budget defaults to `contextWindow − 100K` (exactly the retired hot-terminal semantics; the hot vocabulary is gone). |
 
-**Decision-point readouts** (full absolute form `tokens/window (percent%)`, never percent alone):
+**Decision-point readouts** (full absolute form `tokens/window (percent%)`, never percent alone), plus the ADR-0005 blunt over-budget reminder (sender-side only):
 
-- `link_send` success appends `· <readout>` (` ⚠ hot` when hot); broadcast (`to:"*"`) gets no readout.
-- `link_prompt` result appends a final `[<readout>]` line. Cache freshness is guaranteed by the push-before-response ordering: `agent_end` calls `pushStatus(true)` (force, bypassing debounce) immediately before emitting `prompt_response`, so the freshest `status_update` always precedes the response even at a busy run's tail where the handler's non-force push is debounce-swallowed.
-- `link_compact` success shows `before → after`.
+- `link_send` success appends `· <readout>` and, when the target is over budget, `⚠ "x" over budget: 61K/56K — decide whether to link_compact (or link_new)`; broadcast (`to:"*"`) gets no readout.
+- `link_prompt` result appends a final `[<readout>]` line carrying the same verdict. Cache freshness is guaranteed by the push-before-response ordering: `agent_end` calls `pushStatus(true)` (force, bypassing debounce) immediately before emitting `prompt_response`, so the freshest `status_update` always precedes the response even at a busy run's tail where the handler's non-force push is debounce-swallowed.
+- `link_compact` success shows `before → after` (and re-fires the reminder if the target is still over budget).
+- `link_list` marks over-budget terminals with `⚠ over budget`.
 - Missing cache entries / `tokens: null` omit silently.
 
-**Inbound chat hot annotation** — both delivery paths (steer and batched flush) append a `[⚠ "from" ctx … — headroom …, consider link_compact before dispatching]` line into message *content* for hot senders only, computed at delivery time (not render time). The scheduling audience is the receiving LLM.
+ADR-0005 §2: reminders are **sender-side only** — nothing is injected into the receiver's context (that would spend the over-budget terminal's tokens to tell it it overspent).
 
-The hub stays a dumb fan-out: no subscriptions, no broker, no per-client filtering. Busy-terminal event rate is capped at ~1 msg/s (was several per tool boundary); idle terminals emit 1/60s (net new, negligible). See `docs/adr/0001-status-channel-event-model.md`.
+The hub stays a dumb fan-out (no subscriptions, no broker) — per-recipient visible-set filtering since ADR-0004. Busy-terminal event rate is capped at ~1 msg/s (was several per tool boundary); idle terminals emit 1/60s (net new, negligible). See `docs/adr/0001-status-channel-event-model.md`.
 
 ---
 

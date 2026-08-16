@@ -24,8 +24,10 @@ _Avoid_: context store, registry
 
 **Decision point**:
 A moment where one terminal decides whether/what to dispatch to another and
-should consume the peer context cache: pre-send (tool result), delivery
-(inbound message annotation), and response (prompt result readout).
+should consume the peer context cache. Reminder surfaces are sender-side
+only (ADR-0005 §2): pre-dispatch warning line in send/prompt/compact/new
+tool results, the link_prompt response readout, and the link_list marker.
+Nothing is injected into the receiver's context.
 
 **Headroom**:
 Absolute remaining context of a terminal: `contextWindow − tokens`, computed

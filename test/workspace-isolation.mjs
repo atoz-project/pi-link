@@ -2,16 +2,20 @@
 // Boots the real extension (mocked Pi host) as hub, drives raw WebSocket
 // clients against it, and asserts the issue #11 acceptance checklist:
 // visible sets, fail-closed handshake, cross-group name dedupe, promotion.
+// Raw clients speak protocol v2 (ADR-0005 gate) — VERSION below.
 //
 // Requires node_modules to resolve "ws" (npm install) plus the pi host
 // packages (typebox, @earendil-works/pi-tui) — index.ts imports them.
 // Run: node test/workspace-isolation.mjs
 
+process.env.PI_LINK_PORT ||= "19901"; // isolated test fleet port (before import)
+
 import { WebSocket, WebSocketServer } from "ws";
 import { setTimeout as delay } from "node:timers/promises";
-import createLink from "../index.ts";
+const { default: createLink } = await import("../index.ts");
 
-const PORT = 9900;
+const PORT = 19901;
+const VERSION = 2; // LINK_PROTOCOL_VERSION in index.ts
 let failures = 0;
 
 function assert(cond, label) {
@@ -88,7 +92,11 @@ function rawClient(register) {
       received.push(msg);
       if (msg.type === "welcome") resolve({ ws, received, welcome: msg });
     });
-    ws.on("open", () => ws.send(JSON.stringify({ type: "register", ...register })));
+    ws.on("open", () =>
+      ws.send(
+        JSON.stringify({ type: "register", version: VERSION, ...register }),
+      ),
+    );
     ws.on("error", reject);
   });
 }
@@ -223,9 +231,15 @@ oldHub.on("connection", (sock) => {
     const msg = JSON.parse(raw.toString());
     if (msg.type !== "register") return;
     oldHubRegisters++;
-    // Pre-ADR-0004 hub: welcome without a workspace echo.
+    // Pre-ADR-0004 hub: speaks the current protocol version but predates
+    // workspaces — welcome without a workspace echo.
     sock.send(
-      JSON.stringify({ type: "welcome", name: msg.name, terminals: [msg.name] }),
+      JSON.stringify({
+        type: "welcome",
+        name: msg.name,
+        terminals: [msg.name],
+        version: VERSION,
+      }),
     );
   });
 });
