@@ -18,7 +18,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 
 const EXTENSION = new URL("../index.ts", import.meta.url).pathname;
-const PORT = 9900;
+const PORT = 19903; // isolated test fleet port (PI_LINK_PORT, never the real 9900)
 
 let failures = 0;
 const check = (cond, label) => {
@@ -49,6 +49,7 @@ function startPi(name, workspace) {
     env: {
       ...process.env,
       HOME: mkdtempSync(join(tmpdir(), "pi-link-e2e-home-")),
+      PI_LINK_PORT: String(PORT),
     },
   });
   let log = "";
@@ -61,7 +62,9 @@ function startPi(name, workspace) {
 function killAll() {
   for (const { child } of children) {
     try {
-      child.kill("SIGTERM");
+      // SIGKILL, not SIGTERM: pi traps SIGTERM for graceful shutdown but can
+      // linger with stdin held open, orphaning a hub on the test port.
+      child.kill("SIGKILL");
     } catch {}
   }
 }
@@ -85,7 +88,9 @@ function probe(register, timeoutMs = 5000) {
       }
     });
     ws.on("open", () =>
-      ws.send(JSON.stringify({ type: "register", ...register })),
+      ws.send(
+        JSON.stringify({ type: "register", version: 2, ...register }),
+      ),
     );
     ws.on("error", (e) => {
       clearTimeout(timer);

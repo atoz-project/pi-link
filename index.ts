@@ -24,6 +24,12 @@ import { WebSocket, WebSocketServer } from "ws";
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const DEFAULT_PORT = 9900;
+// Test/fleet isolation knob: PI_LINK_PORT overrides the hub bind port and
+// the default client URL. Read once at module load.
+const LINK_PORT = (() => {
+  const p = parseInt(process.env.PI_LINK_PORT ?? "", 10);
+  return Number.isInteger(p) && p > 0 && p < 65536 ? p : DEFAULT_PORT;
+})();
 const PROMPT_INACTIVITY_MS = 90_000;
 const PROMPT_HARD_CEILING_MS = 1_800_000;
 const COMPACT_TIMEOUT_MS = 180_000;
@@ -34,15 +40,20 @@ const IDLE_RETRY_MS = 500;
 const BATCH_MAX_ITEMS = 20;
 const BATCH_MAX_CHARS = 16_000;
 // ADR-0001 status-channel event model. Trailing-edge debounce window for
-// pushStatus sends; unconditional heartbeat interval while connected; hot
-// terminal headroom threshold. Threshold semantics: hot ⇔ contextWindow −
-// tokens < HOT_HEADROOM_TOKENS (absolute, not percent — percent is
-// incomparable across window sizes, and Pi's own auto-compaction triggers on
-// an absolute reserve). A knob is deliberately deferred per ADR-0001 until a
-// real small-window user or upstream review demands it.
+// pushStatus sends; unconditional heartbeat interval while connected.
 const STATUS_DEBOUNCE_MS = 1_000;
 const HEARTBEAT_INTERVAL_MS = 60_000;
-const HOT_HEADROOM_TOKENS = 100_000;
+// ADR-0005: one budget axis (amends ADR-0001 — the "hot" vocabulary is
+// retired). Undeclared budget defaults to contextWindow − reserve, exactly
+// the old hot semantics; over budget ⇔ tokens ≥ budget.
+const DEFAULT_BUDGET_RESERVE = 100_000;
+// ADR-0005 §8: protocol version gate. Rides register, echoed in welcome;
+// missing/mismatched on either side → loud refusal, no auto-reconnect.
+// Within a versioned link every v2 field is guaranteed present — no
+// per-field fallback paths. Bump on any breaking wire change.
+const LINK_PROTOCOL_VERSION = 2;
+const BUDGET_TIMEOUT_MS = 30_000;
+const NEW_TIMEOUT_MS = 30_000;
 // ADR-0002 public-reachable hub auth. Loopback host set (host not in it
 // = non-loopback). Deliberately conservative: 127.0.0.2 counts as non-loopback,
 // which also makes the fail-closed / no-self-promotion guards testable without
@@ -67,6 +78,11 @@ interface RegisterMsg {
   token?: string;
   // ADR-0004: optional workspace declaration. Absent = global observer.
   workspace?: string;
+  // ADR-0005: version gate + status-channel v2 fields. Guaranteed present
+  // within a versioned link (null = default/none, never absent).
+  version: number;
+  budget: number | null; // declared budget; null = default (window − reserve)
+  model: string | null; // raw provider/model-id:thinkingLevel
 }
 interface WelcomeMsg {
   type: "welcome";
@@ -76,9 +92,15 @@ interface WelcomeMsg {
   cwds?: Record<string, string>;
   contexts?: Record<string, ContextSnapshot>;
   // ADR-0004: echoes the effective workspace (absent = global observer).
-  // A scoped client treats a missing/mismatched echo as refusal (old hub)
-  // and disconnects — isolation is honored or membership is refused.
+  // ADR-0005: this is now an effective-value readback only — the version
+  // gate below is the wire's compatibility mechanism.
   workspace?: string;
+  // ADR-0005: echoed protocol version (the gate) + v2 snapshots, all cut to
+  // the joiner's visible set.
+  version: number;
+  budgets: Record<string, number>; // declared budgets only (absent key = default)
+  models: Record<string, string>;
+  idleSince: Record<string, number>; // idle terminals only (hub clock)
 }
 interface TerminalJoinedMsg {
   type: "terminal_joined";
@@ -121,6 +143,11 @@ interface StatusUpdateMsg {
   // Per-terminal LLM context. Absent = old terminal (ignore); null = clear
   // stored value; object = store. Only status_update carries the null-clear.
   context?: ContextSnapshot | null;
+  // ADR-0005 v2 fields. Client→hub: budget + model (null = default/none).
+  // Hub→client fan-out: the hub attaches idleSince (hub-authoritative clock).
+  budget: number | null;
+  model: string | null;
+  idleSince?: number | null;
 }
 interface ErrorMsg {
   type: "error";
@@ -141,6 +168,39 @@ interface CompactResponseMsg {
   ok: boolean;
   reason?: string; // "busy" | "not_found" | "unsupported" | error text; absent on success
 }
+// ADR-0005 §4: remote budget set. budget null = "off" (clear to default).
+interface BudgetSetMsg {
+  type: "budget_set";
+  id: string;
+  from: string;
+  to: string;
+  budget: number | null;
+}
+interface BudgetResponseMsg {
+  type: "budget_response";
+  id: string;
+  from: string;
+  to: string;
+  ok: boolean;
+  reason?: string; // "not_found" | error text; absent on success
+}
+// ADR-0006: remote fresh session. Ack carries oldSessionId (resurrection
+// metadata) and is sent BEFORE ctx.newSession() tears down the responder.
+interface NewRequestMsg {
+  type: "new_request";
+  id: string;
+  from: string;
+  to: string;
+}
+interface NewResponseMsg {
+  type: "new_response";
+  id: string;
+  from: string;
+  to: string;
+  ok: boolean;
+  oldSessionId?: string;
+  reason?: string; // "busy" | "not_found" | "unsupported" | error text
+}
 
 type LinkStatus =
   | { kind: "idle"; since: number }
@@ -160,7 +220,11 @@ type LinkMessage =
   | StatusUpdateMsg
   | ErrorMsg
   | CompactRequestMsg
-  | CompactResponseMsg;
+  | CompactResponseMsg
+  | BudgetSetMsg
+  | BudgetResponseMsg
+  | NewRequestMsg
+  | NewResponseMsg;
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
@@ -180,6 +244,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("link-workspace", {
     description:
       "Set the pi-link workspace (visibility group) on startup; fixed for the terminal's lifetime",
+    type: "string",
+  });
+
+  pi.registerFlag("link-budget", {
+    description:
+      "Set the pi-link context budget (absolute used-tokens ceiling, e.g. 56k) on startup; runtime-mutable via the link_budget tool",
     type: "string",
   });
 
@@ -218,6 +288,14 @@ export default function (pi: ExtensionAPI) {
   // cannot honor isolation, e.g. an old hub). Same semantics as authFailed:
   // rejection ≠ hub loss — no auto-reconnect; manual /link-connect resets.
   let workspaceRejected = false;
+  // ADR-0005: declared context budget (null = default: window − reserve).
+  // Resolved at session_start (flag > env > saved entry); runtime-mutable
+  // via the link_budget tool (persists the entry).
+  let declaredBudget: number | null = null;
+  // ADR-0005 §8: set when the version gate refused membership (welcome echo
+  // missing/mismatched, or the hub sent a version-rejection error before
+  // close). Same semantics as authFailed; manual /link-connect resets.
+  let versionRejected = false;
 
   // Status tracking (local truth)
   let agentRunning = false;
@@ -230,6 +308,10 @@ export default function (pi: ExtensionAPI) {
   const terminalContexts = new Map<string, ContextSnapshot>(); // other terminals' context
   let currentCwd = "";
   const terminalCwds = new Map<string, string>(); // other terminals' cwds
+  // ADR-0005 v2 peer caches (client role; hub uses hubTerminal* below).
+  const terminalBudgets = new Map<string, number>(); // declared (absent = default)
+  const terminalModels = new Map<string, string>();
+  const terminalIdleSince = new Map<string, number>(); // hub clock
 
   // Hub state
   let wss: WebSocketServer | null = null;
@@ -238,6 +320,9 @@ export default function (pi: ExtensionAPI) {
   const hubTerminalContexts = new Map<string, ContextSnapshot>(); // hub-authoritative
   const hubTerminalCwds = new Map<string, string>(); // hub-authoritative (excludes self)
   const hubTerminalWorkspaces = new Map<string, string>(); // hub-authoritative (excludes self)
+  const hubTerminalBudgets = new Map<string, number>(); // hub-authoritative (excludes self)
+  const hubTerminalModels = new Map<string, string>(); // hub-authoritative (excludes self)
+  const hubIdleSince = new Map<string, number>(); // hub-authoritative clock (excludes self)
 
   // Client state
   let ws: WebSocket | null = null;
@@ -253,6 +338,11 @@ export default function (pi: ExtensionAPI) {
       targetName: string;
       inactivityTimeout: ReturnType<typeof setTimeout>;
       ceilingTimeout: ReturnType<typeof setTimeout>;
+      // ADR-0005 §2/§5: pre-dispatch reminder + per-dispatch budget override,
+      // both captured at request time (the exchange's checks use the
+      // override throughout, including the response readout).
+      preDispatchNote: string;
+      budgetOverride?: number;
     }
   >();
 
@@ -269,12 +359,42 @@ export default function (pi: ExtensionAPI) {
       // ADR-0001: target context readout captured at request time, appended
       // as `before → after` on the success result.
       beforeReadout: string;
+      // ADR-0005 §2: pre-dispatch over-budget reminder, captured at request
+      // time and prepended to the tool result.
+      preDispatchNote: string;
     }
   >();
 
   // Pending remote prompt (this terminal is executing a prompt for someone else)
   let pendingRemotePrompt: { id: string; from: string } | null = null;
   let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Pending budget_set / new_request acks (sender side)
+  const pendingBudgetResponses = new Map<
+    string,
+    {
+      resolve: (result: {
+        content: { type: "text"; text: string }[];
+        details: Record<string, unknown>;
+      }) => void;
+      targetName: string;
+      timeout: ReturnType<typeof setTimeout>;
+      requested: number | null; // the budget we asked for (null = "off")
+    }
+  >();
+  const pendingNewResponses = new Map<
+    string,
+    {
+      resolve: (result: {
+        content: { type: "text"; text: string }[];
+        details: Record<string, unknown>;
+      }) => void;
+      targetName: string;
+      timeout: ReturnType<typeof setTimeout>;
+      // ADR-0005 §2: pre-dispatch over-budget reminder, prepended to the ok result.
+      preDispatchNote: string;
+    }
+  >();
 
   // Inbox: idle-gated batched delivery for triggerTurn:true messages
   const inbox: { from: string; content: string }[] = [];
@@ -388,7 +508,7 @@ export default function (pi: ExtensionAPI) {
   // Resolve the effective hub URL for THIS terminal (client path).
   // PI_LINK_URL env, else default ws://127.0.0.1:9900 (today's behavior).
   function resolveHubUrl(): string {
-    return process.env.PI_LINK_URL || `ws://127.0.0.1:${DEFAULT_PORT}`;
+    return process.env.PI_LINK_URL || `ws://127.0.0.1:${LINK_PORT}`;
   }
 
   // Resolve hub bind host (hub path). PI_LINK_HOST env, else 127.0.0.1.
@@ -506,6 +626,14 @@ export default function (pi: ExtensionAPI) {
       name: terminalName,
       status,
       context: context ?? null, // explicit null tells peers to clear
+      budget: declaredBudget,
+      model: modelLabel(),
+      // ADR-0005 §7: the hub attaches its own idle-since too — clients only
+      // learn hub status via this broadcast, so without it the hub's
+      // idle-since on peers goes stale after the welcome snapshot.
+      ...(role === "hub"
+        ? { idleSince: status.kind === "idle" ? stateSince : null }
+        : {}),
     };
     if (role === "hub") {
       hubBroadcast(msg, terminalName, terminalName);
@@ -576,6 +704,25 @@ export default function (pi: ExtensionAPI) {
     return `${n}`;
   }
 
+  // ADR-0005: parse a budget value — plain tokens ("56000", 56000) or
+  // k-suffix ("56k"/"56K" = 56_000). Undefined = invalid.
+  function parseBudget(raw: unknown): number | undefined {
+    if (typeof raw === "number")
+      return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : undefined;
+    if (typeof raw !== "string") return undefined;
+    const m = raw.trim().match(/^(\d+)([kK])?$/);
+    if (!m) return undefined;
+    const n = parseInt(m[1], 10);
+    return n > 0 ? (m[2] ? n * 1000 : n) : undefined;
+  }
+
+  // ADR-0005 §6: raw provider/model-id:thinkingLevel. Display may shorten.
+  function modelLabel(): string | null {
+    const m = ctx?.model;
+    if (!m) return null;
+    return `${m.provider}/${m.id}:${ctx?.thinkingLevel ?? "off"}`;
+  }
+
   function formatContext(c: ContextSnapshot | null | undefined): string {
     if (!c || c.contextWindow <= 0) return ""; // guard against bad wire data
     const window = formatTokens(c.contextWindow);
@@ -584,35 +731,72 @@ export default function (pi: ExtensionAPI) {
     return `${formatTokens(c.tokens)}/${window} (${percent}%)`;
   }
 
-  // ADR-0001: hotness is absolute headroom, not percent: hot ⇔
-  // contextWindow − tokens < HOT_HEADROOM_TOKENS. Percent is incomparable
-  // across window sizes. Returns false when tokens are unknown (null) —
-  // missing cache entries are omitted silently by readout callers.
-  function isHot(c: ContextSnapshot | null | undefined): boolean {
-    if (!c || c.contextWindow <= 0 || c.tokens === null) return false;
-    return c.contextWindow - c.tokens < HOT_HEADROOM_TOKENS;
+  function getDeclaredBudgetFor(name: string): number | null {
+    if (name === terminalName) return declaredBudget;
+    const map = role === "hub" ? hubTerminalBudgets : terminalBudgets;
+    return map.get(name) ?? null;
+  }
+
+  function getModelFor(name: string): string | null {
+    if (name === terminalName) return modelLabel();
+    const map = role === "hub" ? hubTerminalModels : terminalModels;
+    return map.get(name) ?? null;
+  }
+
+  function getIdleSinceFor(name: string): number | null {
+    if (name === terminalName) {
+      return deriveStatus().kind === "idle" ? stateSince : null;
+    }
+    const map = role === "hub" ? hubIdleSince : terminalIdleSince;
+    return map.get(name) ?? null;
+  }
+
+  // ADR-0005 §1: the one compaction-decision axis. Over budget ⇔
+  // tokens ≥ budget, where budget = declared ?? window − reserve (the
+  // reserve keeps exactly the retired hot-terminal semantics as the default).
+  // overrideBudget = per-dispatch budget (§5): replaces the declared value
+  // for this exchange's check only, never mutates it. Null when tokens
+  // unknown or not over.
+  function overBudget(
+    name: string,
+    overrideBudget?: number,
+  ): { tokens: number; budget: number } | null {
+    const c = getContextFor(name);
+    if (!c || c.tokens === null || c.contextWindow <= 0) return null;
+    const budget =
+      overrideBudget ??
+      getDeclaredBudgetFor(name) ??
+      c.contextWindow - DEFAULT_BUDGET_RESERVE;
+    return c.tokens >= budget ? { tokens: c.tokens, budget } : null;
+  }
+
+  // ADR-0005 §2: the one blunt verdict line. Sender-side surfaces only —
+  // nothing is injected into the receiver's context.
+  function budgetReminder(name: string, overrideBudget?: number): string {
+    if (name === "*") return ""; // broadcast: no readout
+    const hit = overBudget(name, overrideBudget);
+    if (!hit) return "";
+    return `⚠ "${name}" over budget: ${formatTokens(hit.tokens)}/${formatTokens(hit.budget)} — decide whether to link_compact (or link_new)`;
+  }
+
+  // ADR-0005 §5: dispatch budget and declared budget disagree → one-line
+  // notice showing both values (a signal for the user, not auto-resolved).
+  function budgetMismatchNotice(name: string, dispatchBudget?: number): string {
+    if (name === "*" || dispatchBudget === undefined) return "";
+    const declared = getDeclaredBudgetFor(name);
+    if (declared === null || declared === dispatchBudget) return "";
+    return `budget mismatch: dispatch ${formatTokens(dispatchBudget)} vs "${name}" declared ${formatTokens(declared)} (dispatch value used for this exchange only)`;
   }
 
   // ADR-0001 decision-point readout for tool results. Full absolute form —
-  // never percent alone. Appends ` ⚠ hot` when headroom < HOT_HEADROOM_TOKENS.
-  // Returns "" when the target has no cache entry or unknown tokens (omit
-  // silently). Broadcast target ("*") never gets a readout.
+  // never percent alone. Returns "" when the target has no cache entry or
+  // unknown tokens (omit silently). Broadcast target ("*") never gets a
+  // readout. The over-budget verdict is budgetReminder's job, not this one's.
   function contextReadout(name: string): string {
     if (name === "*") return ""; // broadcast: no readout
     const c = getContextFor(name);
     if (!c || c.tokens === null) return ""; // missing cache / unknown — omit
-    const base = formatContext(c);
-    return isHot(c) ? `${base} ⚠ hot` : base;
-  }
-
-  // ADR-0001 inbound-chat delivery-time hot annotation, computed at delivery
-  // time (not render time), appended into message *content*. Hot senders only.
-  // Scheduling audience is the receiving LLM, not a human watching the TUI.
-  function hotAnnotation(name: string): string {
-    const c = getContextFor(name);
-    if (!isHot(c)) return ""; // cold / unknown → no annotation
-    const headroom = c!.contextWindow - c!.tokens!;
-    return `\n[⚠ "${name}" ctx ${formatContext(c)} — headroom ${formatTokens(headroom)}, consider link_compact before dispatching]`;
+    return formatContext(c);
   }
 
   function getStatusFor(name: string): LinkStatus | null {
@@ -683,9 +867,9 @@ export default function (pi: ExtensionAPI) {
     let totalChars = 0;
     for (let i = 0; i < inbox.length && batch.length < BATCH_MAX_ITEMS; i++) {
       const item = inbox[i];
-      // ADR-0001: hot-only annotation computed at delivery time (not render
-      // time), appended after each hot item's text into message *content*.
-      const text = `From "${item.from}":\n${item.content}${hotAnnotation(item.from)}`;
+      // ADR-0005 §2: reminders are sender-side only — nothing is injected
+      // into the receiver's context here.
+      const text = `From "${item.from}":\n${item.content}`;
       if (batch.length > 0 && totalChars + text.length > BATCH_MAX_CHARS) break;
       batch.push(text);
       totalChars += text.length;
@@ -870,7 +1054,11 @@ export default function (pi: ExtensionAPI) {
       | PromptRequestMsg
       | PromptResponseMsg
       | CompactRequestMsg
-      | CompactResponseMsg,
+      | CompactResponseMsg
+      | BudgetSetMsg
+      | BudgetResponseMsg
+      | NewRequestMsg
+      | NewResponseMsg,
   ): boolean {
     if (role === "hub") {
       if (msg.to === "*") {
@@ -899,36 +1087,52 @@ export default function (pi: ExtensionAPI) {
       }
       // Target not found — send error back to sender
       const errText = `Terminal "${msg.to}" not found`;
-      const errorMsg: LinkMessage =
-        msg.type === "prompt_request"
-          ? {
-              type: "prompt_response",
-              id: msg.id,
-              from: terminalName,
-              to: msg.from,
-              response: "",
-              error: errText,
-            }
-          : msg.type === "compact_request"
-            ? {
-                type: "compact_response",
-                id: msg.id,
-                from: terminalName,
-                to: msg.from,
-                ok: false,
-                reason: "not_found",
-              }
-            : { type: "error", message: errText };
+      let errorMsg: LinkMessage;
+      if (msg.type === "prompt_request") {
+        errorMsg = {
+          type: "prompt_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          response: "",
+          error: errText,
+        };
+      } else if (msg.type === "compact_request") {
+        errorMsg = {
+          type: "compact_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          ok: false,
+          reason: "not_found",
+        };
+      } else if (msg.type === "budget_set") {
+        errorMsg = {
+          type: "budget_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          ok: false,
+          reason: "not_found",
+        };
+      } else if (msg.type === "new_request") {
+        errorMsg = {
+          type: "new_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          ok: false,
+          reason: "not_found",
+        };
+      } else {
+        errorMsg = { type: "error", message: errText };
+      }
 
       if (msg.from === terminalName) {
-        // For prompt_request/compact_request, deliver the error response
-        // locally so the matching pending map resolves. For chat, skip — the
-        // tool result (via return false) is sufficient; no extra UI toast.
-        if (
-          errorMsg.type === "prompt_response" ||
-          errorMsg.type === "compact_response"
-        )
-          handleIncoming(errorMsg);
+        // For request/response pairs, deliver the error response locally so
+        // the matching pending map resolves. For chat, skip — the tool
+        // result (via return false) is sufficient; no extra UI toast.
+        if (errorMsg.type !== "error") handleIncoming(errorMsg);
       } else {
         hubClientByName(msg.from)?.send(JSON.stringify(errorMsg));
       }
@@ -947,6 +1151,19 @@ export default function (pi: ExtensionAPI) {
     switch (msg.type) {
       // ── Client receives after registering ──
       case "welcome":
+        // ADR-0005 §8: version gate FIRST — missing/mismatched echo → refuse
+        // membership loudly, stop auto-reconnect (authFailed pattern). One
+        // mechanism replaces per-field compatibility reasoning: below this
+        // line every v2 field is guaranteed present.
+        if (msg.version !== LINK_PROTOCOL_VERSION) {
+          versionRejected = true;
+          notify(
+            `Link hub protocol version mismatch (hub: ${msg.version ?? "none"}, here: v${LINK_PROTOCOL_VERSION} — the fleet upgrades together). Disconnecting; auto-reconnect stopped. /link-connect to retry.`,
+            "error",
+          );
+          ws?.close();
+          break;
+        }
         // ADR-0004 fail-closed handshake: we requested a workspace but the
         // hub's echo is missing or mismatched → the hub cannot honor
         // isolation (e.g. an old hub). Refuse membership: disconnect, loud
@@ -967,6 +1184,9 @@ export default function (pi: ExtensionAPI) {
         terminalStatuses.clear();
         terminalCwds.clear();
         terminalContexts.clear();
+        terminalBudgets.clear();
+        terminalModels.clear();
+        terminalIdleSince.clear();
         if (msg.statuses) {
           for (const [name, status] of Object.entries(msg.statuses)) {
             terminalStatuses.set(name, status);
@@ -981,6 +1201,16 @@ export default function (pi: ExtensionAPI) {
           for (const [name, c] of Object.entries(msg.contexts)) {
             terminalContexts.set(name, c);
           }
+        }
+        // ADR-0005 v2 snapshots (guaranteed present past the version gate).
+        for (const [name, b] of Object.entries(msg.budgets)) {
+          terminalBudgets.set(name, b);
+        }
+        for (const [name, m] of Object.entries(msg.models)) {
+          terminalModels.set(name, m);
+        }
+        for (const [name, t] of Object.entries(msg.idleSince)) {
+          terminalIdleSince.set(name, t);
         }
         updateStatus();
         notify(
@@ -1007,8 +1237,11 @@ export default function (pi: ExtensionAPI) {
         if (role !== "hub") {
           terminalCwds.delete(msg.name);
           terminalContexts.delete(msg.name);
+          terminalBudgets.delete(msg.name);
+          terminalModels.delete(msg.name);
+          terminalIdleSince.delete(msg.name);
         }
-        // Fail any pending prompts/compacts to the departed terminal
+        // Fail any pending prompts/compacts/budgets/news to the departed terminal
         for (const [id, pending] of pendingPromptResponses) {
           if (pending.targetName === msg.name) {
             const p = cleanupPending(id);
@@ -1035,6 +1268,33 @@ export default function (pi: ExtensionAPI) {
             }
           }
         }
+        for (const [id, pending] of pendingBudgetResponses) {
+          if (pending.targetName === msg.name) {
+            clearTimeout(pending.timeout);
+            pendingBudgetResponses.delete(id);
+            pending.resolve(
+              textResult(`Terminal "${msg.name}" disconnected`, {
+                to: msg.name,
+                error: "disconnected",
+              }),
+            );
+          }
+        }
+        for (const [id, pending] of pendingNewResponses) {
+          if (pending.targetName === msg.name) {
+            clearTimeout(pending.timeout);
+            pendingNewResponses.delete(id);
+            // ADR-0006: left→joined IS the completion signal for a
+            // successful new — the ack already resolved ok. A left arriving
+            // while still pending means the target died before acking.
+            pending.resolve(
+              textResult(`Terminal "${msg.name}" disconnected`, {
+                to: msg.name,
+                error: "disconnected",
+              }),
+            );
+          }
+        }
         updateStatus();
         notify(`"${msg.name}" left the link`, "info");
         break;
@@ -1044,6 +1304,13 @@ export default function (pi: ExtensionAPI) {
         terminalStatuses.set(msg.name, msg.status);
         if (msg.context) terminalContexts.set(msg.name, msg.context);
         else if (msg.context === null) terminalContexts.delete(msg.name);
+        // ADR-0005 v2 fields (present past the version gate; null = clear).
+        if (typeof msg.budget === "number") terminalBudgets.set(msg.name, msg.budget);
+        else if (msg.budget === null) terminalBudgets.delete(msg.name);
+        if (msg.model) terminalModels.set(msg.name, msg.model);
+        else if (msg.model === null) terminalModels.delete(msg.name);
+        if (typeof msg.idleSince === "number") terminalIdleSince.set(msg.name, msg.idleSince);
+        else if (msg.idleSince === null) terminalIdleSince.delete(msg.name);
         resetInactivityFor(msg.name);
         break;
 
@@ -1053,13 +1320,12 @@ export default function (pi: ExtensionAPI) {
           inbox.push({ from: msg.from, content: msg.content });
           scheduleFlush(FLUSH_DELAY_MS);
         } else {
-          // ADR-0001: hot-only annotation computed at delivery time (not
-          // render time), appended into message *content*. The scheduling
-          // audience is the receiving LLM, not a human watching the TUI.
+          // ADR-0005 §2: no receiver-side annotation — the over-budget
+          // reminder lives on the sender's surfaces only.
           pi.sendMessage(
             {
               customType: "link",
-              content: msg.content + hotAnnotation(msg.from),
+              content: msg.content,
               display: true,
               details: { from: msg.from },
             },
@@ -1162,14 +1428,25 @@ export default function (pi: ExtensionAPI) {
             // ADR-0001: append final-line readout of the target's context at
             // response time (decision point). Cache freshness is guaranteed by
             // the push-before-response ordering: peer `agent_end` pushes
-            // status before emitting `prompt_response`. Full absolute form;
-            // ` ⚠ hot` when headroom < HOT_HEADROOM_TOKENS. Omit silently when
-            // the target has no cache entry / unknown tokens.
+            // status before emitting `prompt_response`. Full absolute form.
+            // Omit silently when the target has no cache entry / unknown
+            // tokens. ADR-0005: the over-budget verdict (with any
+            // per-dispatch override) rides the same readout line.
             const readout = contextReadout(pending.targetName);
-            const response = readout
-              ? `${msg.response}\n[${readout}]`
+            const reminder = budgetReminder(
+              pending.targetName,
+              pending.budgetOverride,
+            );
+            const note = [readout, reminder].filter(Boolean).join(" · ");
+            const response = note
+              ? `${msg.response}\n[${note}]`
               : msg.response;
-            pending.resolve(textResult(response, { from: msg.from }));
+            pending.resolve(
+              textResult(
+                [pending.preDispatchNote, response].filter(Boolean).join("\n"),
+                { from: msg.from },
+              ),
+            );
           }
         }
         break;
@@ -1191,13 +1468,148 @@ export default function (pi: ExtensionAPI) {
               before || after
                 ? ` · ${before || "?"} → ${after || "?"}`
                 : "";
+            // ADR-0005: pre-dispatch reminder leads; if the target is STILL
+            // over budget after compacting, the verdict re-fires.
+            const still = budgetReminder(target);
             pending.resolve(
-              textResult(`Compacted "${target}"${suffix}`, { to: target }),
+              textResult(
+                [pending.preDispatchNote, `Compacted "${target}"${suffix}`, still]
+                  .filter(Boolean)
+                  .join("\n"),
+                { to: target },
+              ),
             );
           } else {
             const reason = msg.reason ?? "failed";
             pending.resolve(
               textResult(`Compact on "${target}" not done: ${reason}`, {
+                to: target,
+                error: reason,
+              }),
+            );
+          }
+        }
+        break;
+      }
+
+      // ── Another terminal sets our context budget (ADR-0005 §4) ──
+      case "budget_set": {
+        // A threshold, not a membership invariant — runtime mutation is safe
+        // (contrast workspace, fixed for life). No extra authorization: link
+        // membership is already full power (ADR-0002). Wire values still pass
+        // the same validator as the tool path (positive integers only).
+        declaredBudget = parseBudget(msg.budget) ?? null;
+        pi.appendEntry("link-budget", { budget: declaredBudget });
+        pushStatus(true); // immediate status_update so peers see the new value
+        routeMessage({
+          type: "budget_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          ok: true,
+        });
+        notify(
+          `"${msg.from}" set context budget to ${declaredBudget !== null ? formatTokens(declaredBudget) : "default"}`,
+          "info",
+        );
+        break;
+      }
+
+      // ── Response to a budget set we requested ──
+      case "budget_response": {
+        const pending = pendingBudgetResponses.get(msg.id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          pendingBudgetResponses.delete(msg.id);
+          const target = pending.targetName;
+          if (msg.ok) {
+            const what =
+              pending.requested !== null
+                ? formatTokens(pending.requested)
+                : "default";
+            pending.resolve(
+              textResult(`Budget on "${target}" set to ${what}`, {
+                to: target,
+              }),
+            );
+          } else {
+            const reason = msg.reason ?? "failed";
+            pending.resolve(
+              textResult(`Budget set on "${target}" not done: ${reason}`, {
+                to: target,
+                error: reason,
+              }),
+            );
+          }
+        }
+        break;
+      }
+
+      // ── Another terminal asks us to start a fresh session (ADR-0006) ──
+      case "new_request": {
+        // Busy guard identical to link_compact: mid-turn, pending remote
+        // prompt, or compacting → decline; retry when idle.
+        if (agentRunning || pendingRemotePrompt || compactRunning) {
+          routeMessage({
+            type: "new_response",
+            id: msg.id,
+            from: terminalName,
+            to: msg.from,
+            ok: false,
+            reason: "busy",
+          });
+          break;
+        }
+        // ADR-0006 §3: ack BEFORE teardown — session replacement kills this
+        // socket and this extension instance; the responder ceases to exist.
+        // The ack carries oldSessionId (resurrection metadata; pi never
+        // deletes session files, so "new" destroys nothing on disk).
+        const oldSessionId = ctx?.sessionManager.getSessionId();
+        routeMessage({
+          type: "new_response",
+          id: msg.id,
+          from: terminalName,
+          to: msg.from,
+          ok: true,
+          oldSessionId,
+        });
+        notify(`"${msg.from}" requested a fresh session`, "info");
+        // ctx.newSession() lives on the COMMAND context only (event/tool
+        // contexts lack session-control methods). Routing through a
+        // registered command — sendUserMessage with expandPromptTemplates:
+        // true hits pi's extension-command interception — runs our handler
+        // with a command ctx. Command handlers manage their own LLM
+        // interaction, so no prompt reaches the agent.
+        newNowExpected = true;
+        pi.sendUserMessage("/link-new-now", { expandPromptTemplates: true });
+        break;
+      }
+
+      // ── Response to a fresh-session request we sent ──
+      case "new_response": {
+        const pending = pendingNewResponses.get(msg.id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          pendingNewResponses.delete(msg.id);
+          const target = pending.targetName;
+          if (msg.ok) {
+            // Completion = observing terminal_left → terminal_joined for the
+            // same name (the ack arrives before teardown by design).
+            pending.resolve(
+              textResult(
+                [
+                  pending.preDispatchNote,
+                  `Fresh session on "${target}" acknowledged (old session ${msg.oldSessionId ?? "unknown"}) — it will leave and rejoin under the same name`,
+                ]
+                  .filter(Boolean)
+                  .join("\n"),
+                { to: target, oldSessionId: msg.oldSessionId },
+              ),
+            );
+          } else {
+            const reason = msg.reason ?? "failed";
+            pending.resolve(
+              textResult(`Fresh session on "${target}" not done: ${reason}`, {
                 to: target,
                 error: reason,
               }),
@@ -1214,6 +1626,11 @@ export default function (pi: ExtensionAPI) {
         // (auth rejection ≠ hub loss).
         if (/auth rejected/i.test(msg.message)) {
           authFailed = true;
+        }
+        // ADR-0005 §8: hub-side version gate rejects with an error before
+        // close — flag it so the close handler stops auto-reconnect.
+        if (/protocol version rejected/i.test(msg.message)) {
+          versionRejected = true;
         }
         break;
     }
@@ -1232,6 +1649,23 @@ export default function (pi: ExtensionAPI) {
       // First message must be register
       if (msg.type === "register") {
         if (clientName) return; // already registered — ignore duplicate
+
+        // ADR-0005 §8: version gate before anything else. Missing/mismatched
+        // → error + close (the client's error handler stops auto-reconnect).
+        if (msg.version !== LINK_PROTOCOL_VERSION) {
+          clientWs.send(
+            JSON.stringify({
+              type: "error",
+              message: `Link protocol version rejected: hub speaks v${LINK_PROTOCOL_VERSION}, register had ${msg.version ?? "none"} — the fleet upgrades together`,
+            } satisfies ErrorMsg),
+          );
+          notify(
+            `Rejected link register (protocol version ${msg.version ?? "none"} ≠ v${LINK_PROTOCOL_VERSION})`,
+            "error",
+          );
+          clientWs.close();
+          return;
+        }
 
         // ADR-0002: uniform auth when the hub has a token (resolved in
         // startHub). Loopback clients also authenticate — one code path,
@@ -1277,6 +1711,13 @@ export default function (pi: ExtensionAPI) {
         const clientWorkspace = normalizeName(msg.workspace);
         if (clientWorkspace)
           hubTerminalWorkspaces.set(clientName, clientWorkspace);
+        // ADR-0005 v2: declared budget + model (null = default/none).
+        if (typeof msg.budget === "number")
+          hubTerminalBudgets.set(clientName, msg.budget);
+        if (msg.model) hubTerminalModels.set(clientName, msg.model);
+        // ADR-0005 §7: a freshly registered terminal is idle — start its
+        // idle-since clock (hub-authoritative).
+        hubIdleSince.set(clientName, Date.now());
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
         if (msg.context) hubTerminalContexts.set(clientName, msg.context);
         // ADR-0004: the joiner's welcome snapshot is cut to its visible set.
@@ -1309,6 +1750,32 @@ export default function (pi: ExtensionAPI) {
         for (const [name, c] of hubTerminalContexts) {
           if (name !== clientName && visible.has(name)) contexts[name] = c;
         }
+        // ADR-0005 v2 snapshots, same visible-set cut.
+        const budgets: Record<string, number> = {};
+        if (declaredBudget !== null && visible.has(terminalName)) {
+          budgets[terminalName] = declaredBudget;
+        }
+        for (const [name, b] of hubTerminalBudgets) {
+          if (name !== clientName && visible.has(name)) budgets[name] = b;
+        }
+        const models: Record<string, string> = {};
+        const hubModel = modelLabel();
+        if (hubModel && visible.has(terminalName)) {
+          models[terminalName] = hubModel;
+        }
+        for (const [name, m] of hubTerminalModels) {
+          if (name !== clientName && visible.has(name)) models[name] = m;
+        }
+        const idleSinceRec: Record<string, number> = {};
+        if (
+          visible.has(terminalName) &&
+          deriveStatus().kind === "idle"
+        ) {
+          idleSinceRec[terminalName] = stateSince;
+        }
+        for (const [name, t] of hubIdleSince) {
+          if (name !== clientName && visible.has(name)) idleSinceRec[name] = t;
+        }
         clientWs.send(
           JSON.stringify({
             type: "welcome",
@@ -1317,8 +1784,14 @@ export default function (pi: ExtensionAPI) {
             statuses,
             cwds,
             contexts,
-            // ADR-0004: echo the effective workspace — the fail-closed
-            // handshake the client checks against its request.
+            budgets,
+            models,
+            idleSince: idleSinceRec,
+            // ADR-0005 §8: echo the protocol version — the gate the client
+            // checks before anything else.
+            version: LINK_PROTOCOL_VERSION,
+            // ADR-0004: echo the effective workspace — an effective-value
+            // readback (the version gate is the compatibility mechanism).
             ...(clientWorkspace ? { workspace: clientWorkspace } : {}),
           } satisfies WelcomeMsg),
         );
@@ -1341,15 +1814,37 @@ export default function (pi: ExtensionAPI) {
 
       // Status update — store and fan out to other clients only (not back to hub)
       if (msg.type === "status_update") {
+        const prevStatus = hubTerminalStatuses.get(clientName);
         hubTerminalStatuses.set(clientName, msg.status);
+        // ADR-0005 §7: idle-since on the hub clock — set on busy→idle
+        // transitions (register-as-idle already started the clock), cleared
+        // while busy.
+        if (
+          msg.status.kind === "idle" &&
+          prevStatus &&
+          prevStatus.kind !== "idle"
+        )
+          hubIdleSince.set(clientName, Date.now());
+        else if (msg.status.kind !== "idle") hubIdleSince.delete(clientName);
+        // ADR-0005 v2: declared budget + model (null = clear to default/none).
+        if (typeof msg.budget === "number")
+          hubTerminalBudgets.set(clientName, msg.budget);
+        else if (msg.budget === null) hubTerminalBudgets.delete(clientName);
+        if (msg.model) hubTerminalModels.set(clientName, msg.model);
+        else if (msg.model === null) hubTerminalModels.delete(clientName);
         if (msg.context) hubTerminalContexts.set(clientName, msg.context);
         else if (msg.context === null) hubTerminalContexts.delete(clientName);
         resetInactivityFor(clientName);
+        // ADR-0005 §9: the hub re-serializes from a whitelist — unlisted
+        // fields clients may send are dropped by design.
         const normalized: StatusUpdateMsg = {
           type: "status_update",
           name: clientName,
           status: msg.status,
           context: msg.context, // undefined omitted by JSON; null forwarded to clear
+          budget: msg.budget,
+          model: msg.model,
+          idleSince: hubIdleSince.get(clientName) ?? null,
         };
         const json = JSON.stringify(normalized);
         // ADR-0004: fan out only to clients that can see the updater (also
@@ -1372,7 +1867,11 @@ export default function (pi: ExtensionAPI) {
         msg.type === "prompt_request" ||
         msg.type === "prompt_response" ||
         msg.type === "compact_request" ||
-        msg.type === "compact_response"
+        msg.type === "compact_response" ||
+        msg.type === "budget_set" ||
+        msg.type === "budget_response" ||
+        msg.type === "new_request" ||
+        msg.type === "new_response"
       ) {
         routeMessage({ ...msg, from: clientName });
       }
@@ -1386,6 +1885,9 @@ export default function (pi: ExtensionAPI) {
       hubTerminalStatuses.delete(name);
       hubTerminalContexts.delete(name);
       hubTerminalCwds.delete(name);
+      hubTerminalBudgets.delete(name);
+      hubTerminalModels.delete(name);
+      hubIdleSince.delete(name);
       connectedTerminals = hubVisibleNames(terminalName);
       updateStatus();
       const left: TerminalLeftMsg = {
@@ -1415,7 +1917,7 @@ export default function (pi: ExtensionAPI) {
       if (!isLoopbackHost(bindHost)) {
         const token = resolveHubToken();
         if (!token) {
-          const reason = `Refusing to start hub on non-loopback ${bindHost}:${DEFAULT_PORT} — no token resolvable in ${PROFILES_FILE_PATH}. Set a profile token before exposing the hub.`;
+          const reason = `Refusing to start hub on non-loopback ${bindHost}:${LINK_PORT} — no token resolvable in ${PROFILES_FILE_PATH}. Set a profile token before exposing the hub.`;
           console.error(`Link: ${reason}`);
           notify(reason, "error");
           resolve(false);
@@ -1431,7 +1933,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const server = new WebSocketServer({
-        port: DEFAULT_PORT,
+        port: LINK_PORT,
         host: bindHost,
       });
 
@@ -1453,7 +1955,7 @@ export default function (pi: ExtensionAPI) {
         updateStatus();
         const authSuffix = resolvedToken ? " (auth: token required)" : "";
         notify(
-          `Link hub started on ${bindHost}:${DEFAULT_PORT} as "${terminalName}"${authSuffix}`,
+          `Link hub started on ${bindHost}:${LINK_PORT} as "${terminalName}"${authSuffix}`,
           "info",
         );
         startHeartbeat();
@@ -1526,6 +2028,10 @@ export default function (pi: ExtensionAPI) {
             name: preferredName ?? terminalName,
             cwd: currentCwd || undefined,
             context: captureContext(),
+            // ADR-0005 §8: version gate + v2 fields (null = default/none).
+            version: LINK_PROTOCOL_VERSION,
+            budget: declaredBudget,
+            model: modelLabel(),
             ...(token ? { token } : {}),
             // ADR-0004: declare workspace (absent = global observer).
             ...(workspace ? { workspace } : {}),
@@ -1560,9 +2066,10 @@ export default function (pi: ExtensionAPI) {
               `Link auth rejected by hub (token mismatch or missing). Auto-reconnect stopped. Check ${PROFILES_FILE_PATH}, then /link-connect.`,
               "error",
             );
-          } else if (workspaceRejected) {
-            // ADR-0004: already notified loudly at the welcome handshake;
-            // just hold the line — no auto-reconnect (rejection ≠ hub loss).
+          } else if (workspaceRejected || versionRejected) {
+            // ADR-0004/0005: already notified loudly at the handshake (or via
+            // the hub's rejection error); just hold the line — no
+            // auto-reconnect (rejection ≠ hub loss).
           } else if (!manuallyDisconnected) {
             notify("Disconnected from link hub", "warning");
             scheduleReconnect();
@@ -1594,16 +2101,18 @@ export default function (pi: ExtensionAPI) {
     // only. Terminals local to the hub machine (loopback URL) keep today's
     // promotion. authFailed never self-promotes either (the rejection was
     // for THIS terminal's token; promoting would bind a hub the same token
-    // can't satisfy — and the user must intervene).
+    // can't satisfy — and the user must intervene). versionRejected joins
+    // the guard (ADR-0005): a terminal the fleet refused for its version
+    // must not promote itself into a version-split hub.
     const hubHost = resolvedHubUrl ? urlHost(resolvedHubUrl) : null;
     const nonLoopback = hubHost ? !isLoopbackHost(hubHost) : false;
-    if (!nonLoopback && !authFailed) {
+    if (!nonLoopback && !authFailed && !versionRejected) {
       if (await startHub()) return;
     }
 
     // Hub not reachable and we cannot (or must not) promote. Retry after delay.
-    if (authFailed) {
-      // Auth rejection: do not schedule reconnect (stops the hammer).
+    if (authFailed || versionRejected) {
+      // Rejection: do not schedule reconnect (stops the hammer).
       return;
     }
     scheduleReconnect();
@@ -1660,6 +2169,16 @@ export default function (pi: ExtensionAPI) {
         );
       }
     }
+    for (const [id, pending] of pendingBudgetResponses) {
+      clearTimeout(pending.timeout);
+      pending.resolve(textResult("Link disconnected", { error: "disconnected" }));
+      pendingBudgetResponses.delete(id);
+    }
+    for (const [id, pending] of pendingNewResponses) {
+      clearTimeout(pending.timeout);
+      pending.resolve(textResult("Link disconnected", { error: "disconnected" }));
+      pendingNewResponses.delete(id);
+    }
 
     // Close client connection
     if (ws) {
@@ -1684,6 +2203,12 @@ export default function (pi: ExtensionAPI) {
     terminalCwds.clear();
     hubTerminalCwds.clear();
     hubTerminalWorkspaces.clear();
+    terminalBudgets.clear();
+    terminalModels.clear();
+    terminalIdleSince.clear();
+    hubTerminalBudgets.clear();
+    hubTerminalModels.clear();
+    hubIdleSince.clear();
     lastPushedKind = null;
     lastPushedTool = null;
     lastStatusSendAt = 0;
@@ -1824,6 +2349,42 @@ export default function (pi: ExtensionAPI) {
         ) ?? null;
     }
 
+    // Resolve context budget (ADR-0005 §3). Precedence mirrors link-name:
+    //   --link-budget flag  >  PI_LINK_BUDGET env  >  saved link-budget  >  default (window − reserve)
+    // Accepts "56k"/"56K"/plain tokens; invalid = error (flag) / ignore
+    // (env, entry). PI_LINK_BUDGET is consumed once and removed so spawned
+    // children don't inherit it. Runtime-mutable via the link_budget tool.
+    const budgetFlagRaw = pi.getFlag("link-budget");
+    let budgetFlag: number | undefined;
+    if (typeof budgetFlagRaw === "string") {
+      budgetFlag = parseBudget(budgetFlagRaw);
+      if (budgetFlag === undefined) {
+        console.error(
+          `Error: --link-budget requires a token count (e.g. 56k or 56000), got "${budgetFlagRaw}".`,
+        );
+        process.exit(1);
+      }
+    }
+    const budgetEnvRaw = process.env.PI_LINK_BUDGET;
+    delete process.env.PI_LINK_BUDGET;
+    const budgetResolved = budgetFlag ?? parseBudget(budgetEnvRaw);
+    if (budgetResolved !== undefined) {
+      declaredBudget = budgetResolved;
+      // Skip re-append when the saved entry already matches (same growth
+      // guard as link-name).
+      const latestBudget = latestCustomData("link-budget") as
+        | { budget?: unknown }
+        | undefined;
+      if (parseBudget(latestBudget?.budget) !== budgetResolved) {
+        pi.appendEntry("link-budget", { budget: budgetResolved });
+      }
+    } else {
+      const savedBudget = latestCustomData("link-budget") as
+        | { budget?: unknown }
+        | undefined;
+      declaredBudget = parseBudget(savedBudget?.budget) ?? null;
+    }
+
     if (flagName || shouldConnect()) scheduleStartupConnect();
   });
 
@@ -1840,6 +2401,16 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_compact", async () => {
     // Tokens just dropped sharply — force a push so peers see the new context.
+    pushStatus(true);
+  });
+
+  // ADR-0005 §6: the model label rides status_update; re-push on mid-session
+  // model (or thinking-level) changes so peers' labels stay current.
+  pi.on("model_select", async () => {
+    pushStatus(true);
+  });
+
+  pi.on("thinking_level_select", async () => {
     pushStatus(true);
   });
 
@@ -1973,6 +2544,15 @@ export default function (pi: ExtensionAPI) {
         description:
           "true wakes the receiver's LLM; false delivers passively (busy = steered into the live run; idle = stored, not processed).",
       }),
+      // ADR-0005 §5: optional per-dispatch budget override (tokens). Used
+      // for this exchange's over-budget check only; never mutates the
+      // target's declared budget. A mismatch notice shows both values.
+      budget: Type.Optional(
+        Type.Number({
+          description:
+            "Per-dispatch context budget override in tokens (e.g. 56000); overrides the target's declared budget for this exchange's over-budget check only",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params) {
@@ -2007,10 +2587,16 @@ export default function (pi: ExtensionAPI) {
       }
       // Hub delivery is authoritative; client delivery is optimistic (hub routes)
       const verb = role === "hub" ? "Sent to" : "Sent to hub for delivery to";
-      // ADR-0001: append target context readout (decision point). Full
-      // absolute form; ` ⚠ hot` when headroom < HOT_HEADROOM_TOKENS.
+      // ADR-0001/0005 decision point: context readout + blunt over-budget
+      // reminder (sender-side only) + per-dispatch mismatch notice.
       // Broadcast ("*") gets no readout; missing cache / unknown tokens omit.
       const readout = contextReadout(params.to);
+      // Sanitize the per-dispatch override — invalid values (negative,
+      // fractional, NaN) are ignored rather than fed into the comparison.
+      const sendOverride =
+        params.budget !== undefined ? parseBudget(params.budget) : undefined;
+      const reminder = budgetReminder(params.to, sendOverride);
+      const mismatch = budgetMismatchNotice(params.to, sendOverride);
       // ADR-0003: idle-target warning on a successful direct send with
       // triggerTurn:false. A passive send to an idle receiver is stored but
       // not processed (steer lands in the session without waking the LLM);
@@ -2024,7 +2610,9 @@ export default function (pi: ExtensionAPI) {
           idleWarning = ` ⚠ "${params.to}" is idle — message stored, not processed; resend with triggerTurn:true or use link_prompt`;
         }
       }
-      const suffix = [readout, idleWarning].filter(Boolean).join(" ");
+      const suffix = [readout, reminder, mismatch, idleWarning]
+        .filter(Boolean)
+        .join(" ");
       const suffixStr = suffix ? ` · ${suffix}` : "";
       return textResult(`${verb} ${target}${suffixStr}`, {
         to: params.to,
@@ -2088,7 +2676,11 @@ export default function (pi: ExtensionAPI) {
 
       const requestId = crypto.randomUUID();
 
-      return new Promise((resolve) => {
+      // ADR-0005 §2: pre-dispatch reminder, captured at request time and
+      // prepended to the tool result (the sender's decision point).
+      const preDispatchNote = budgetReminder(params.to);
+
+      return new Promise<ReturnType<typeof textResult>>((resolve) => {
         const timeout = setTimeout(() => {
           const pending = cleanupPendingCompact(requestId);
           if (pending) {
@@ -2109,6 +2701,7 @@ export default function (pi: ExtensionAPI) {
           // Empty when the target has no cache entry / unknown tokens — then
           // the success result just omits the before→after suffix.
           beforeReadout: contextReadout(params.to),
+          preDispatchNote,
         });
 
         signal?.addEventListener(
@@ -2160,6 +2753,243 @@ export default function (pi: ExtensionAPI) {
     renderResult: (result, _options, theme) => renderIconResult(result, theme),
   });
 
+  // ADR-0005 §4: remote budget set. Hub-routed budget_set → target updates
+  // its declared budget, persists the session entry, pushes an immediate
+  // status_update, acks. No extra authorization (trust domain, ADR-0002);
+  // visible-set addressing applies (cross-workspace → not_found).
+  pi.registerTool({
+    name: "link_budget",
+    label: "Link Budget",
+    description: [
+      "Set a Pi terminal's declared context budget (absolute used-tokens ceiling; over budget ⇔ tokens ≥ budget).",
+      'budget is a token count (e.g. 56000) or "off" to clear back to the default (contextWindow − 100K).',
+      "The target persists the value, pushes an immediate status update, and acks. Works on any terminal in your visible set, yourself included.",
+    ].join(" "),
+    promptSnippet: "Set a terminal's declared context budget on the link",
+    parameters: Type.Object({
+      to: Type.String({ description: "Target terminal name" }),
+      budget: Type.Union([Type.Number(), Type.Literal("off")], {
+        description:
+          'Absolute used-tokens ceiling (e.g. 56000), or "off" to clear back to the default',
+      }),
+    }),
+
+    async execute(_toolCallId, params, signal) {
+      if (signal?.aborted) {
+        return textResult("Budget request aborted", {
+          to: params.to,
+          error: "aborted",
+        });
+      }
+      if (role === "disconnected") return notConnectedResult();
+
+      const next = params.budget === "off" ? null : parseBudget(params.budget);
+      if (params.budget !== "off" && next === undefined) {
+        return textResult(`Invalid budget: ${params.budget}`, {
+          to: params.to,
+          error: "invalid",
+        });
+      }
+      const what = next != null ? formatTokens(next) : "default";
+
+      // Self-targeting allowed — apply locally, no routing.
+      if (params.to === terminalName) {
+        declaredBudget = next ?? null;
+        pi.appendEntry("link-budget", { budget: declaredBudget });
+        pushStatus(true);
+        return textResult(`Budget on "${terminalName}" set to ${what}`, {
+          to: params.to,
+        });
+      }
+
+      const miss = targetNotFound(params.to);
+      if (miss) return miss;
+
+      const requestId = crypto.randomUUID();
+      return new Promise<ReturnType<typeof textResult>>((resolve) => {
+        const timeout = setTimeout(() => {
+          const pending = pendingBudgetResponses.get(requestId);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            pendingBudgetResponses.delete(requestId);
+            pending.resolve(
+              textResult(
+                `Budget request to "${params.to}" timed out (${BUDGET_TIMEOUT_MS / 1000}s)`,
+                { to: params.to, error: "timeout" },
+              ),
+            );
+          }
+        }, BUDGET_TIMEOUT_MS);
+
+        pendingBudgetResponses.set(requestId, {
+          resolve,
+          targetName: params.to,
+          timeout,
+          requested: next ?? null,
+        });
+
+        signal?.addEventListener(
+          "abort",
+          () => {
+            const pending = pendingBudgetResponses.get(requestId);
+            if (pending) {
+              clearTimeout(pending.timeout);
+              pendingBudgetResponses.delete(requestId);
+              pending.resolve(
+                textResult("Budget request aborted", {
+                  to: params.to,
+                  error: "aborted",
+                }),
+              );
+            }
+          },
+          { once: true },
+        );
+
+        const delivered = routeMessage({
+          type: "budget_set",
+          id: requestId,
+          from: terminalName,
+          to: params.to,
+          budget: next ?? null,
+        });
+        if (!delivered) {
+          const pending = pendingBudgetResponses.get(requestId);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            pendingBudgetResponses.delete(requestId);
+            pending.resolve(
+              textResult(`Failed to request budget set on "${params.to}"`, {
+                to: params.to,
+                error: "not_delivered",
+              }),
+            );
+          }
+        }
+      });
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("link_budget "));
+      text += theme.fg("accent", String(args.to));
+      text += " " + theme.fg("dim", String(args.budget));
+      return new Text(text, 0, 0);
+    },
+
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
+  });
+
+  // ADR-0006: the third lifecycle op over the link — start a brand-new
+  // session in place. Ack-before-teardown (carries oldSessionId); identity
+  // (name + workspace) is pre-written into the new session; completion is
+  // observed as terminal_left → terminal_joined for the same name.
+  pi.registerTool({
+    name: "link_new",
+    label: "Link New",
+    description: [
+      "Ask another Pi terminal to start a brand-new session in place (fresh context; history stays resumable on disk).",
+      "Busy targets (mid-turn, pending remote prompt, or compacting) decline; retry when idle.",
+      "The target acks with its old session id, then leaves and rejoins under the same name and workspace.",
+    ].join(" "),
+    promptSnippet: "Ask another Pi terminal to start a fresh session",
+    parameters: Type.Object({
+      to: Type.String({ description: "Target terminal name" }),
+    }),
+
+    async execute(_toolCallId, params, signal) {
+      if (signal?.aborted) {
+        return textResult("New-session request aborted", {
+          to: params.to,
+          error: "aborted",
+        });
+      }
+      if (role === "disconnected") return notConnectedResult();
+
+      if (params.to === terminalName) {
+        return textResult("Cannot start a fresh session on yourself - use /new.", {
+          to: params.to,
+          error: "self_target",
+        });
+      }
+
+      const miss = targetNotFound(params.to);
+      if (miss) return miss;
+
+      const requestId = crypto.randomUUID();
+      // ADR-0005 §2: pre-dispatch over-budget reminder (fresh session is one
+      // of the two remedies the verdict names — the sender still decides).
+      const preDispatchNote = budgetReminder(params.to);
+      return new Promise<ReturnType<typeof textResult>>((resolve) => {
+        const timeout = setTimeout(() => {
+          const pending = pendingNewResponses.get(requestId);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            pendingNewResponses.delete(requestId);
+            pending.resolve(
+              textResult(
+                `New-session request to "${params.to}" timed out (${NEW_TIMEOUT_MS / 1000}s)`,
+                { to: params.to, error: "timeout" },
+              ),
+            );
+          }
+        }, NEW_TIMEOUT_MS);
+
+        pendingNewResponses.set(requestId, {
+          resolve,
+          targetName: params.to,
+          timeout,
+          preDispatchNote,
+        });
+
+        signal?.addEventListener(
+          "abort",
+          () => {
+            const pending = pendingNewResponses.get(requestId);
+            if (pending) {
+              clearTimeout(pending.timeout);
+              pendingNewResponses.delete(requestId);
+              pending.resolve(
+                textResult("New-session request aborted", {
+                  to: params.to,
+                  error: "aborted",
+                }),
+              );
+            }
+          },
+          { once: true },
+        );
+
+        const delivered = routeMessage({
+          type: "new_request",
+          id: requestId,
+          from: terminalName,
+          to: params.to,
+        });
+        if (!delivered) {
+          const pending = pendingNewResponses.get(requestId);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            pendingNewResponses.delete(requestId);
+            pending.resolve(
+              textResult(`Failed to request fresh session on "${params.to}"`, {
+                to: params.to,
+                error: "not_delivered",
+              }),
+            );
+          }
+        }
+      });
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("link_new "));
+      text += theme.fg("accent", String(args.to));
+      return new Text(text, 0, 0);
+    },
+
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
+  });
+
   pi.registerTool({
     name: "link_prompt",
     label: "Link Prompt",
@@ -2173,6 +3003,14 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       to: Type.String({ description: "Target terminal name" }),
       prompt: Type.String({ description: "Prompt to send" }),
+      // ADR-0005 §5: optional per-dispatch budget override (tokens) — this
+      // exchange's checks only, never mutates the target's declared budget.
+      budget: Type.Optional(
+        Type.Number({
+          description:
+            "Per-dispatch context budget override in tokens (e.g. 56000); overrides the target's declared budget for this exchange's over-budget check only",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params, signal) {
@@ -2196,8 +3034,12 @@ export default function (pi: ExtensionAPI) {
       if (miss) return miss;
 
       const requestId = crypto.randomUUID();
+      // Sanitize the per-dispatch override — invalid values (negative,
+      // fractional, NaN) are ignored rather than fed into the comparison.
+      const promptOverride =
+        params.budget !== undefined ? parseBudget(params.budget) : undefined;
 
-      return new Promise((resolve) => {
+      return new Promise<ReturnType<typeof textResult>>((resolve) => {
         const inactivityTimeout = makeInactivityTimeout(requestId, params.to);
 
         const ceilingTimeout = setTimeout(() => {
@@ -2217,6 +3059,16 @@ export default function (pi: ExtensionAPI) {
           targetName: params.to,
           inactivityTimeout,
           ceilingTimeout,
+          // ADR-0005 §2/§5: pre-dispatch reminder + mismatch notice (both
+          // values) lead the result; the override also governs the response
+          // readout's verdict.
+          preDispatchNote: [
+            budgetReminder(params.to, promptOverride),
+            budgetMismatchNotice(params.to, promptOverride),
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          budgetOverride: promptOverride,
         });
 
         // Abort handling
@@ -2303,19 +3155,26 @@ export default function (pi: ExtensionAPI) {
       const statuses: Record<string, string> = {};
       const cwds: Record<string, string> = {};
       const contexts: Record<string, ContextSnapshot> = {};
+      const models: Record<string, string> = {};
+      const overBudgetNames: string[] = [];
       const list = connectedTerminals
         .map((name) => {
           const status = getStatusFor(name);
-          const statusStr = status ? formatStatus(status) : "";
+          let statusStr = status ? formatStatus(status) : "";
+          if (status?.kind === "idle") {
+            const idle = getIdleSinceFor(name);
+            if (idle) statusStr = `idle (${formatDuration(idle)})`;
+          }
           if (statusStr) statuses[name] = statusStr;
           const cwd = getCwdFor(name);
           if (cwd) cwds[name] = cwd;
           const context = getContextFor(name);
           if (context) contexts[name] = context;
-          const ctxStr = formatContext(context);
-          const marker = name === terminalName ? " (you)" : "";
-          let line = `  \u2022 ${name}${marker}${statusStr ? "  " + statusStr : ""}`;
-          if (ctxStr) line += `  \u00b7 ${ctxStr}`;
+          const model = getModelFor(name);
+          if (model) models[name] = model;
+          const over = overBudget(name) !== null;
+          if (over) overBudgetNames.push(name);
+          let line = terminalLine(name, "  \u2022");
           if (cwd) line += `\n    cwd: ${cwd}`;
           return line;
         })
@@ -2326,6 +3185,8 @@ export default function (pi: ExtensionAPI) {
         statuses,
         cwds,
         contexts,
+        models,
+        overBudget: overBudgetNames,
         self: terminalName,
         role,
       });
@@ -2338,6 +3199,8 @@ export default function (pi: ExtensionAPI) {
             statuses?: Record<string, string>;
             cwds?: Record<string, string>;
             contexts?: Record<string, ContextSnapshot>;
+            models?: Record<string, string>;
+            overBudget?: string[];
             self?: string;
             role?: string;
           }
@@ -2350,22 +3213,48 @@ export default function (pi: ExtensionAPI) {
       let text = theme.fg("toolTitle", theme.bold("link "));
       text += theme.fg("muted", `(${details.role}) `);
       text += theme.fg("accent", `${details.terminals.length} terminal(s)`);
+      const overSet = new Set(details.overBudget ?? []);
       for (const name of details.terminals) {
         const isSelf = name === details.self;
         const status = details.statuses?.[name] ?? "";
         const cwd = details.cwds?.[name];
         const ctxStr = formatContext(details.contexts?.[name]);
+        const model = details.models?.[name];
         const nameStr = isSelf ? `\u2022 ${name} (you)` : `\u2022 ${name}`;
         text +=
           "\n  " +
           (isSelf ? theme.fg("accent", nameStr) : theme.fg("text", nameStr)) +
           (status ? "  " + theme.fg("dim", status) : "") +
           (ctxStr ? theme.fg("dim", "  \u00b7 " + ctxStr) : "");
+        if (overSet.has(name)) text += theme.fg("warning", " ⚠ over budget");
+        if (model) text += theme.fg("dim", "  \u00b7 " + model);
         if (cwd) text += "\n    " + theme.fg("dim", `cwd: ${shortenPath(cwd)}`);
       }
       return new Text(text, 0, 0);
     },
   });
+
+  // Shared one-line terminal summary for link_list and /link. ADR-0005:
+  // idle duration prefers the hub-authoritative idle-since clock; the
+  // over-budget marker is the link_list reminder surface (§2); the model
+  // label shows raw (display may shorten) (§6).
+  function terminalLine(name: string, bullet = "\u2022"): string {
+    const status = getStatusFor(name);
+    let statusStr = status ? formatStatus(status) : "";
+    if (status?.kind === "idle") {
+      const idle = getIdleSinceFor(name);
+      if (idle) statusStr = `idle (${formatDuration(idle)})`;
+    }
+    const ctxStr = formatContext(getContextFor(name));
+    const over = overBudget(name) !== null;
+    const model = getModelFor(name);
+    const marker = name === terminalName ? " (you)" : "";
+    let line = `${bullet} ${name}${marker}${statusStr ? "  " + statusStr : ""}`;
+    if (ctxStr) line += `  \u00b7 ${ctxStr}`;
+    if (over) line += " ⚠ over budget";
+    if (model) line += `  \u00b7 ${model}`;
+    return line;
+  }
 
   // ── Commands ─────────────────────────────────────────────────────────────
 
@@ -2377,13 +3266,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const lines = connectedTerminals.map((name) => {
-        const status = getStatusFor(name);
-        const statusStr = status ? formatStatus(status) : "";
         const cwd = getCwdFor(name);
-        const ctxStr = formatContext(getContextFor(name));
-        const marker = name === terminalName ? " (you)" : "";
-        let line = `${name}${marker}${statusStr ? ": " + statusStr : ""}`;
-        if (ctxStr) line += ` \u00b7 ${ctxStr}`;
+        let line = terminalLine(name, "");
         if (cwd) line += `\n  cwd: ${shortenPath(cwd)}`;
         return line;
       });
@@ -2524,6 +3408,56 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Set by the new_request wire handler right before it re-enters through
+  // the command path; the command refuses interactive use otherwise.
+  let newNowExpected = false;
+
+  // ADR-0006: execution half of link_new. newSession() exists only on the
+  // command context, so the wire handler (above) re-enters through this
+  // command. The ack already went out before this runs; identity (name +
+  // workspace + budget + connect intent) is pre-written into the new
+  // session so the new instance rejoins identically.
+  pi.registerCommand("link-new-now", {
+    description: "Internal: execute a remote fresh-session request (ADR-0006)",
+    handler: async (_args, cmdCtx) => {
+      if (!newNowExpected) {
+        cmdCtx.ui.notify(
+          "Internal command (remote fresh-session execution half) — nothing pending. Use /new for a local fresh session.",
+          "warning",
+        );
+        return;
+      }
+      newNowExpected = false;
+      const carryName = preferredName ?? terminalName;
+      const carryWorkspace = workspace;
+      const carryBudget = declaredBudget;
+      try {
+        const { cancelled } = await cmdCtx.newSession({
+          setup: async (sm) => {
+            sm.appendCustomEntry("link-name", { name: carryName });
+            if (carryWorkspace)
+              sm.appendCustomEntry("link-workspace", {
+                workspace: carryWorkspace,
+              });
+            if (carryBudget !== null)
+              sm.appendCustomEntry("link-budget", { budget: carryBudget });
+            sm.appendCustomEntry("link-active", { active: true });
+          },
+        });
+        if (cancelled)
+          cmdCtx.ui.notify(
+            "Fresh session cancelled — still on the old session",
+            "warning",
+          );
+      } catch (e) {
+        cmdCtx.ui.notify(
+          `Fresh session failed: ${e instanceof Error ? e.message : String(e)}`,
+          "error",
+        );
+      }
+    },
+  });
+
   pi.registerCommand("link-connect", {
     description: "Connect to the link",
     handler: async (_args, _ctx) => {
@@ -2542,6 +3476,8 @@ export default function (pi: ExtensionAPI) {
       // ADR-0004: same reset for a refused workspace handshake (likely after
       // upgrading the hub).
       workspaceRejected = false;
+      // ADR-0005: same reset for a refused protocol version.
+      versionRejected = false;
       // Reset plaintext-warning so a new manual connect can re-fire it.
       plaintextWarningFired = false;
       await initialize();
