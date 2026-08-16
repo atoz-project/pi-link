@@ -265,6 +265,26 @@ With cloudflared: publish the local `9900` port through a named tunnel and point
 
 **Mixed-version rule.** `register` carries an optional `token` field (old hubs ignore unknown fields). Upgrade all terminals before enabling auth so a mix of old (unauthenticated) and new (token-expected) hubs doesn't fragment the fleet.
 
+### Workspaces (ADR-0004)
+
+A workspace is an opt-in **visibility group** (hygiene, not security — the trust domain is unchanged: one link, one hub, one token). Terminals that declare the same workspace see each other; terminals in different workspaces are mutually invisible; terminals without a workspace are **global observers** that see everyone and are seen by everyone (this is exactly the pre-workspace behavior, so a no-workspace fleet is unchanged except one echo field in `welcome`).
+
+**Declaring a workspace** (fixed at startup; changing it = restart the terminal):
+
+| Precedence | Source |
+| 1 (highest) | `pi --link-workspace <name>` |
+| 2 | `PI_LINK_WORKSPACE` env (consumed once, not inherited by children) |
+| 3 | saved `link-workspace` session entry (restored on resume) |
+| 4 | none — global observer |
+
+Names are normalized like link names. The workspace is never derived from the cwd — worktrees and monorepos would fragment groups.
+
+**The visible set is the universe.** For a scoped terminal it is *same-workspace members ∪ global observers*, and it cuts every surface: `link_list`, the welcome snapshot, `terminal_joined`/`terminal_left` (including their membership lists), broadcasts, status fan-out, and direct addressing — cross-workspace `link_send`/`link_prompt`/`link_compact` returns `not_found`, exactly as if the target didn't exist. Link names stay globally unique across all workspaces (a cross-group collision still dedupes to `name-2`).
+
+**Fail-closed handshake.** `register` carries the workspace and `welcome` echoes the effective one. A scoped terminal that gets a missing or mismatched echo (i.e., an old hub that can't honor isolation) disconnects loudly and **stops auto-reconnect** — isolation is honored or membership is refused, there is no degraded mode. **Upgrade the hub first**, then `/link-connect` on the scoped terminals.
+
+**Hub and promotion.** The hub routes for all workspaces regardless of its own membership; promotion ignores workspace — any survivor can promote and correctly serves every group after clients re-register.
+
 ---
 
 ## LLM Tools

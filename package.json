@@ -30,6 +30,10 @@
   "dependencies": {
     "ws": "^8.20.0"
   },
+  "scripts": {
+    "test": "node test/workspace-isolation.mjs",
+    "test:e2e": "node test/e2e-real-terminals.mjs"
+  },
   "devDependencies": {
     "@types/ws": "^8.18.1"
   },
