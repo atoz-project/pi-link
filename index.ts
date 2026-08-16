@@ -65,6 +65,8 @@ interface RegisterMsg {
   // profile token; absent otherwise. Old hubs ignore unknown fields
   // (fork-first, upstream PR later).
   token?: string;
+  // ADR-0004: optional workspace declaration. Absent = global observer.
+  workspace?: string;
 }
 interface WelcomeMsg {
   type: "welcome";
@@ -73,6 +75,10 @@ interface WelcomeMsg {
   statuses?: Record<string, LinkStatus>;
   cwds?: Record<string, string>;
   contexts?: Record<string, ContextSnapshot>;
+  // ADR-0004: echoes the effective workspace (absent = global observer).
+  // A scoped client treats a missing/mismatched echo as refusal (old hub)
+  // and disconnects — isolation is honored or membership is refused.
+  workspace?: string;
 }
 interface TerminalJoinedMsg {
   type: "terminal_joined";
@@ -171,6 +177,12 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("link-workspace", {
+    description:
+      "Set the pi-link workspace (visibility group) on startup; fixed for the terminal's lifetime",
+    type: "string",
+  });
+
   // ── State ────────────────────────────────────────────────────────────────
 
   let role: "hub" | "client" | "disconnected" = "disconnected";
@@ -198,6 +210,14 @@ export default function (pi: ExtensionAPI) {
   // Whether the plaintext-warning has fired this session (ADR-0002 §1:
   // exactly once per session, not per reconnect).
   let plaintextWarningFired = false;
+  // ADR-0004: this terminal's declared workspace (null = global observer).
+  // Resolved once at session_start; fixed for the terminal's lifetime.
+  let workspace: string | null = null;
+  // ADR-0004: set when the hub's welcome failed the workspace handshake
+  // (requested a workspace but the echo was missing/mismatched = the hub
+  // cannot honor isolation, e.g. an old hub). Same semantics as authFailed:
+  // rejection ≠ hub loss — no auto-reconnect; manual /link-connect resets.
+  let workspaceRejected = false;
 
   // Status tracking (local truth)
   let agentRunning = false;
@@ -217,6 +237,7 @@ export default function (pi: ExtensionAPI) {
   const hubTerminalStatuses = new Map<string, LinkStatus>(); // hub-authoritative
   const hubTerminalContexts = new Map<string, ContextSnapshot>(); // hub-authoritative
   const hubTerminalCwds = new Map<string, string>(); // hub-authoritative (excludes self)
+  const hubTerminalWorkspaces = new Map<string, string>(); // hub-authoritative (excludes self)
 
   // Client state
   let ws: WebSocket | null = null;
@@ -299,7 +320,7 @@ export default function (pi: ExtensionAPI) {
     const info =
       role === "disconnected"
         ? "link: offline"
-        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""}`;
+        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""}${workspace ? ` · ws:${workspace}` : ""}`;
     ui.setStatus("link", theme.fg("dim", info));
   }
 
@@ -487,7 +508,7 @@ export default function (pi: ExtensionAPI) {
       context: context ?? null, // explicit null tells peers to clear
     };
     if (role === "hub") {
-      hubBroadcast(msg, terminalName);
+      hubBroadcast(msg, terminalName, terminalName);
     } else if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
@@ -758,6 +779,33 @@ export default function (pi: ExtensionAPI) {
     return Array.from(allTerminalNames()).sort();
   }
 
+  // ── ADR-0004 visible set ──────────────────────────────────────────────
+
+  // Visible-set rule: viewer sees target iff either is a global observer
+  // (no workspace) or both share a workspace. Symmetric. (Named canSee —
+  // `ws` already means WebSocket throughout this file.)
+  function canSee(
+    viewerWs: string | undefined,
+    targetWs: string | undefined,
+  ): boolean {
+    return !viewerWs || !targetWs || viewerWs === targetWs;
+  }
+
+  // Hub-side workspace of any terminal (hub's own included). undefined =
+  // global observer. Callers must check existence separately — unknown names
+  // also yield undefined, so never use this alone as an existence check.
+  function hubWorkspaceOf(name: string): string | undefined {
+    return name === terminalName
+      ? (workspace ?? undefined)
+      : hubTerminalWorkspaces.get(name);
+  }
+
+  // Hub: sorted names visible to `viewer` (viewer included).
+  function hubVisibleNames(viewer: string): string[] {
+    const v = hubWorkspaceOf(viewer);
+    return terminalList().filter((n) => canSee(v, hubWorkspaceOf(n)));
+  }
+
   function safeParse(data: string): LinkMessage | null {
     try {
       return JSON.parse(data);
@@ -768,14 +816,38 @@ export default function (pi: ExtensionAPI) {
 
   // ── Routing ──────────────────────────────────────────────────────────────
 
-  /** Hub: broadcast a message to every terminal except `excludeName`. */
-  function hubBroadcast(msg: LinkMessage, excludeName?: string) {
-    const json = JSON.stringify(msg);
+  /** Hub: broadcast a message to every terminal except `excludeName` that can
+   *  see `subject` (ADR-0004 visible set). terminal_joined/left get a
+   *  recipient-scoped `terminals` array — no cross-group name leaks via
+   *  membership lists. */
+  function hubBroadcast(msg: LinkMessage, subject: string, excludeName?: string) {
+    const subjectWs = hubWorkspaceOf(subject);
+    // Membership events get per-recipient `terminals` arrays; every other
+    // type serializes once (ADR-0001 §6 serialize-once-write-N preserved).
+    const shared =
+      msg.type === "terminal_joined" || msg.type === "terminal_left"
+        ? null
+        : JSON.stringify(msg);
     for (const [clientWs, name] of hubClients) {
-      if (name !== excludeName) clientWs.send(json);
+      if (name === excludeName) continue;
+      if (!canSee(hubWorkspaceOf(name), subjectWs)) continue;
+      clientWs.send(shared ?? JSON.stringify(scopedForRecipient(msg, name)));
     }
-    // Also deliver to the hub itself (unless excluded)
-    if (excludeName !== terminalName) handleIncoming(msg);
+    // Also deliver to the hub itself (unless excluded or out of the visible set)
+    if (
+      excludeName !== terminalName &&
+      canSee(workspace ?? undefined, subjectWs)
+    )
+      handleIncoming(shared ? msg : scopedForRecipient(msg, terminalName));
+  }
+
+  /** Per-recipient view of a broadcast message: membership events carry the
+   *  recipient's own visible set, everything else goes out as-is. */
+  function scopedForRecipient(msg: LinkMessage, recipient: string): LinkMessage {
+    if (msg.type === "terminal_joined" || msg.type === "terminal_left") {
+      return { ...msg, terminals: hubVisibleNames(recipient) };
+    }
+    return msg;
   }
 
   /** Hub: find a client WebSocket by name. */
@@ -802,17 +874,28 @@ export default function (pi: ExtensionAPI) {
   ): boolean {
     if (role === "hub") {
       if (msg.to === "*") {
-        hubBroadcast(msg, msg.from);
+        // ADR-0004: from scoped → own group + global observers; from a
+        // global observer → everyone.
+        hubBroadcast(msg, msg.from, msg.from);
         return true;
       }
+      // ADR-0004: cross-group direct addressing is not_found at the hub.
+      // Existence is checked before visibility — hubWorkspaceOf on an unknown
+      // name yields undefined, which canSee would read as a global observer.
       if (msg.to === terminalName) {
-        handleIncoming(msg);
-        return true;
-      }
-      const targetWs = hubClientByName(msg.to);
-      if (targetWs) {
-        targetWs.send(JSON.stringify(msg));
-        return true;
+        if (canSee(hubWorkspaceOf(msg.from), workspace ?? undefined)) {
+          handleIncoming(msg);
+          return true;
+        }
+      } else {
+        const targetSock = hubClientByName(msg.to);
+        if (
+          targetSock &&
+          canSee(hubWorkspaceOf(msg.from), hubWorkspaceOf(msg.to))
+        ) {
+          targetSock.send(JSON.stringify(msg));
+          return true;
+        }
       }
       // Target not found — send error back to sender
       const errText = `Terminal "${msg.to}" not found`;
@@ -864,6 +947,20 @@ export default function (pi: ExtensionAPI) {
     switch (msg.type) {
       // ── Client receives after registering ──
       case "welcome":
+        // ADR-0004 fail-closed handshake: we requested a workspace but the
+        // hub's echo is missing or mismatched → the hub cannot honor
+        // isolation (e.g. an old hub). Refuse membership: disconnect, loud
+        // notify, stop auto-reconnect via the authFailed pattern. Isolation
+        // is honored or membership is refused — no warning-only mode.
+        if (workspace && msg.workspace !== workspace) {
+          workspaceRejected = true;
+          notify(
+            `Link hub did not honor workspace "${workspace}" (echo: ${msg.workspace ? `"${msg.workspace}"` : "none"} — upgrade the hub first). Disconnecting; auto-reconnect stopped. /link-connect to retry.`,
+            "error",
+          );
+          ws?.close();
+          break;
+        }
         terminalName = msg.name;
         pendingClientRename = false;
         connectedTerminals = msg.terminals;
@@ -887,7 +984,7 @@ export default function (pi: ExtensionAPI) {
         }
         updateStatus();
         notify(
-          `Joined link as "${terminalName}" (${connectedTerminals.length} online)`,
+          `Joined link as "${terminalName}" (${connectedTerminals.length} online)${workspace ? ` · workspace "${workspace}"` : ""}`,
           "info",
         );
         pushStatus(true);
@@ -1176,49 +1273,66 @@ export default function (pi: ExtensionAPI) {
 
         clientName = uniqueName(msg.name);
         hubClients.set(clientWs, clientName);
+        // ADR-0004: record the declared workspace (absent = global observer).
+        const clientWorkspace = normalizeName(msg.workspace);
+        if (clientWorkspace)
+          hubTerminalWorkspaces.set(clientName, clientWorkspace);
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
         if (msg.context) hubTerminalContexts.set(clientName, msg.context);
-        const list = terminalList();
-        connectedTerminals = list;
+        // ADR-0004: the joiner's welcome snapshot is cut to its visible set.
+        const visibleNames = hubVisibleNames(clientName);
+        const visible = new Set(visibleNames);
+        connectedTerminals = hubVisibleNames(terminalName);
         updateStatus();
 
-        // Confirm to the new client (include status + cwd snapshots)
+        // Confirm to the new client (include status + cwd snapshots, visible
+        // set only — no cross-group leaks via the welcome payload)
         const statuses: Record<string, LinkStatus> = {};
-        statuses[terminalName] = deriveStatus(); // hub's own status
+        if (visible.has(terminalName)) {
+          statuses[terminalName] = deriveStatus(); // hub's own status
+        }
         for (const [name, status] of hubTerminalStatuses) {
-          if (name !== clientName) statuses[name] = status;
+          if (name !== clientName && visible.has(name)) statuses[name] = status;
         }
         const cwds: Record<string, string> = {};
-        if (currentCwd) cwds[terminalName] = currentCwd; // hub's own cwd
+        if (visible.has(terminalName) && currentCwd) {
+          cwds[terminalName] = currentCwd; // hub's own cwd
+        }
         for (const [name, cwd] of hubTerminalCwds) {
-          if (name !== clientName) cwds[name] = cwd;
+          if (name !== clientName && visible.has(name)) cwds[name] = cwd;
         }
         const contexts: Record<string, ContextSnapshot> = {};
         const hubContext = captureContext();
-        if (hubContext) contexts[terminalName] = hubContext; // hub's own context
+        if (hubContext && visible.has(terminalName)) {
+          contexts[terminalName] = hubContext; // hub's own context
+        }
         for (const [name, c] of hubTerminalContexts) {
-          if (name !== clientName) contexts[name] = c;
+          if (name !== clientName && visible.has(name)) contexts[name] = c;
         }
         clientWs.send(
           JSON.stringify({
             type: "welcome",
             name: clientName,
-            terminals: list,
+            terminals: visibleNames,
             statuses,
             cwds,
             contexts,
+            // ADR-0004: echo the effective workspace — the fail-closed
+            // handshake the client checks against its request.
+            ...(clientWorkspace ? { workspace: clientWorkspace } : {}),
           } satisfies WelcomeMsg),
         );
 
-        // Notify everyone else (include joiner's cwd + context)
+        // Notify everyone in the joiner's visible set (include joiner's cwd +
+        // context; `terminals` is scoped per recipient inside hubBroadcast)
         const joined: TerminalJoinedMsg = {
           type: "terminal_joined",
           name: clientName,
-          terminals: list,
+          terminals: [],
           cwd: msg.cwd,
           context: msg.context,
         };
-        hubBroadcast(joined, clientName);
+        hubBroadcast(joined, clientName, clientName);
         return;
       }
 
@@ -1238,8 +1352,14 @@ export default function (pi: ExtensionAPI) {
           context: msg.context, // undefined omitted by JSON; null forwarded to clear
         };
         const json = JSON.stringify(normalized);
+        // ADR-0004: fan out only to clients that can see the updater (also
+        // trims the ADR-0001 broadcast bill).
         for (const [otherWs, name] of hubClients) {
-          if (name !== clientName) otherWs.send(json);
+          if (
+            name !== clientName &&
+            canSee(hubWorkspaceOf(name), hubWorkspaceOf(clientName))
+          )
+            otherWs.send(json);
         }
         return;
       }
@@ -1266,15 +1386,17 @@ export default function (pi: ExtensionAPI) {
       hubTerminalStatuses.delete(name);
       hubTerminalContexts.delete(name);
       hubTerminalCwds.delete(name);
-      const list = terminalList();
-      connectedTerminals = list;
+      connectedTerminals = hubVisibleNames(terminalName);
       updateStatus();
       const left: TerminalLeftMsg = {
         type: "terminal_left",
         name,
-        terminals: list,
+        terminals: [], // scoped per recipient inside hubBroadcast
       };
-      hubBroadcast(left, name);
+      // Fan out within the departed terminal's visible set BEFORE deleting its
+      // workspace entry — the visibility check still needs it.
+      hubBroadcast(left, name, name);
+      hubTerminalWorkspaces.delete(name);
     });
 
     clientWs.on("error", () => {
@@ -1405,6 +1527,8 @@ export default function (pi: ExtensionAPI) {
             cwd: currentCwd || undefined,
             context: captureContext(),
             ...(token ? { token } : {}),
+            // ADR-0004: declare workspace (absent = global observer).
+            ...(workspace ? { workspace } : {}),
           } satisfies RegisterMsg),
         );
         resolve(true);
@@ -1436,6 +1560,9 @@ export default function (pi: ExtensionAPI) {
               `Link auth rejected by hub (token mismatch or missing). Auto-reconnect stopped. Check ${PROFILES_FILE_PATH}, then /link-connect.`,
               "error",
             );
+          } else if (workspaceRejected) {
+            // ADR-0004: already notified loudly at the welcome handshake;
+            // just hold the line — no auto-reconnect (rejection ≠ hub loss).
           } else if (!manuallyDisconnected) {
             notify("Disconnected from link hub", "warning");
             scheduleReconnect();
@@ -1556,6 +1683,7 @@ export default function (pi: ExtensionAPI) {
     hubTerminalContexts.clear();
     terminalCwds.clear();
     hubTerminalCwds.clear();
+    hubTerminalWorkspaces.clear();
     lastPushedKind = null;
     lastPushedTool = null;
     lastStatusSendAt = 0;
@@ -1653,6 +1781,47 @@ export default function (pi: ExtensionAPI) {
         const sessionName = normalizeName(pi.getSessionName());
         if (sessionName) terminalName = sessionName;
       }
+    }
+
+    // Resolve workspace (ADR-0004). Precedence mirrors link-name:
+    //   --link-workspace flag  >  PI_LINK_WORKSPACE env  >  saved link-workspace  >  none (global observer)
+    // Fixed at startup — no runtime command, never derived from cwd. Empty
+    // after normalize = error (flag) / ignore (env, entry). PI_LINK_WORKSPACE
+    // is consumed once and removed so spawned children don't inherit it.
+    const workspaceFlagRaw = pi.getFlag("link-workspace");
+    let workspaceFlag: string | undefined;
+    if (typeof workspaceFlagRaw === "string") {
+      workspaceFlag = normalizeName(workspaceFlagRaw);
+      if (!workspaceFlag) {
+        console.error("Error: --link-workspace requires a non-empty value.");
+        process.exit(1);
+      }
+    }
+    const workspaceEnvRaw = process.env.PI_LINK_WORKSPACE;
+    delete process.env.PI_LINK_WORKSPACE;
+    const workspaceResolved = workspaceFlag ?? normalizeName(workspaceEnvRaw);
+    if (workspaceResolved) {
+      workspace = workspaceResolved;
+      // Skip re-append when the saved entry already matches (same growth
+      // guard as link-name).
+      const latestWs = latestCustomData("link-workspace") as
+        | { workspace?: unknown }
+        | undefined;
+      const latestSavedWs =
+        typeof latestWs?.workspace === "string" ? latestWs.workspace : undefined;
+      if (normalizeName(latestSavedWs) !== workspaceResolved) {
+        pi.appendEntry("link-workspace", { workspace: workspaceResolved });
+      }
+    } else {
+      const savedWorkspace = latestCustomData("link-workspace") as
+        | { workspace?: unknown }
+        | undefined;
+      workspace =
+        normalizeName(
+          typeof savedWorkspace?.workspace === "string"
+            ? savedWorkspace.workspace
+            : undefined,
+        ) ?? null;
     }
 
     if (flagName || shouldConnect()) scheduleStartupConnect();
@@ -2272,22 +2441,25 @@ export default function (pi: ExtensionAPI) {
         }
         const old = terminalName;
         terminalName = newName;
-        const list = terminalList();
-        connectedTerminals = list;
+        connectedTerminals = hubVisibleNames(terminalName);
         updateStatus();
-        // Notify clients only — hub already updated local state
+        // Notify clients only — hub already updated local state. ADR-0004:
+        // the rebroadcast stays within the renamed terminal's visible set
+        // (subject = the hub's own name; its workspace is unchanged by a rename).
         hubBroadcast(
-          { type: "terminal_left", name: old, terminals: list },
+          { type: "terminal_left", name: old, terminals: [] },
+          terminalName,
           terminalName,
         );
         hubBroadcast(
           {
             type: "terminal_joined",
             name: newName,
-            terminals: list,
+            terminals: [],
             cwd: currentCwd,
             context: captureContext(),
           },
+          terminalName,
           terminalName,
         );
         pushStatus(true);
@@ -2367,6 +2539,9 @@ export default function (pi: ExtensionAPI) {
       // ADR-0002: manual /link-connect resets the auth-rejection flag —
       // the user has decided to retry (likely after fixing the token).
       authFailed = false;
+      // ADR-0004: same reset for a refused workspace handshake (likely after
+      // upgrading the hub).
+      workspaceRejected = false;
       // Reset plaintext-warning so a new manual connect can re-fire it.
       plaintextWarningFired = false;
       await initialize();
