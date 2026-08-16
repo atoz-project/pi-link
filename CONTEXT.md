@@ -96,8 +96,8 @@ _Avoid_: account, credential, URL env (retired)
 
 **Resurrection**:
 Bringing a retired or dead terminal back by resuming its session file —
-explicitly, by id: look up with `pi-link --list -g` / `--resolve <name>`,
-then `pi --link --session <id>`. Never implicit by name: the launcher's
+explicitly, by path: look up with `pi-link --list -g` / `--resolve <name>`,
+then `pi --link --session <path>`. Never implicit by name: the launcher's
 name→session execution mode is retired because resuming into an unexpected
 live context (or silently creating a blank one on a typo) executes where
 nobody decided to (ADR-0007). Identity rides the session (name, workspace,

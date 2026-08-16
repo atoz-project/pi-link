@@ -1,21 +1,22 @@
 #!/usr/bin/env node
 
-// pi-link CLI — launch Pi with session resume by name
+// pi-link CLI — query pi-link sessions by name (ADR-0007 §8: query-only).
 //
 // Usage:
-//   pi-link <name> [--global|-g] [flags...]
-//                                Resume or create a named session, connected to link.
 //   pi-link --list [--global|-g] List pi-link sessions in current cwd (or everywhere).
 //   pi-link --resolve <name> [--global|-g]
 //                                Print just the session path (machine-readable).
 //   pi-link --version            Print the installed pi-link version.
+//
+// Launching is explicit — the name→session execution mode is retired:
+//   fresh start  → pi --link --link-name <name>
+//   resurrect    → pi-link --resolve <name> -g, then pi --link --session <path>
 
 import { readdir, stat } from "fs/promises";
 import { createReadStream, existsSync, readFileSync } from "fs";
 import { createInterface } from "readline";
 import { join } from "path";
 import { homedir } from "os";
-import { spawn } from "child_process";
 
 // Canonicalize a link/session name: trim + collapse internal whitespace.
 // Must match the extension's normalizeName (index.ts).
@@ -24,7 +25,7 @@ function normalizeName(s) {
 }
 
 // ── Pi config resolution ───────────────────────────────────────────────────
-// Match Pi's session-dir lookup order so list/resolve/<name> see what Pi sees.
+// Match Pi's session-dir lookup order so --list/--resolve see what Pi sees.
 // Custom sessionDir → flat layout; default → <agentDir>/sessions/<encoded-cwd>.
 
 // Match Pi's expandTildePath: only `~` and `~/...`.
@@ -193,8 +194,8 @@ async function scanSessions(dir, isCustom) {
 // Find sessions whose current display name matches `targetName`. Returns both
 // local-cwd matches and all matches (cross-cwd) so the caller can default to
 // local while still surfacing a hint when non-local matches exist. Falls back
-// to `session_info.name` for sessions without a link-name (so `pi-link <name>`
-// can attach link to a previously-unlinked named session).
+// to `session_info.name` for sessions without a link-name (so --resolve can
+// find a previously-unlinked named session for explicit resurrection).
 async function findSessionsByName(targetName, dir, isCustom) {
   const localCwd = normalizePath(process.cwd());
   const all = (await scanSessions(dir, isCustom))
@@ -241,34 +242,32 @@ function renderTable(rows, columns) {
 
 const rawArgs = process.argv.slice(2);
 
-// Reject Pi flags that pi-link manages, plus --link-name (which exists at the
-// `pi` level for link-only naming, but the wrapper's combined-mode contract
-// conflicts with it). Called from Phase 4 (mode entry) and Phase 5 (after
-// launcher name), so it fires on both `pi-link --session foo` and
-// `pi-link foo --session bar` with the friendly message.
-function rejectManagedFlag(token) {
-  const key = token.split("=")[0];
-  if (key === "--link-name") {
-    console.error(
-      "Error: --link-name is not accepted by the pi-link wrapper.\n" +
-      "  Use 'pi-link <name>' for combined link+session,\n" +
-      "  or run 'pi --link-name <name>' directly to set link name without session resolution.",
-    );
-    process.exit(1);
-  }
-  if (["--session", "--continue", "-c", "--resume", "-r", "--fork", "--no-session", "--session-dir"].includes(key)) {
-    console.error(`Error: ${key} is managed by pi-link. Remove it.`);
-    process.exit(1);
-  }
-}
-
 function printCandidates(name, matches) {
   console.error(`Multiple sessions named "${name}":\n`);
   for (const m of matches) {
     console.error(`  ${m.modified.toISOString().slice(0, 19)}  cwd: ${m.cwd}`);
     console.error(`  ${m.path}\n`);
   }
-  console.error(`Use: pi --session <path> --link`);
+  console.error(`Use: pi --link --session <path>`);
+  process.exit(1);
+}
+
+// ADR-0007 §8 / #16: the launcher execution mode is retired. A bare
+// positional refuses with the two explicit spellings — implicit resume drops
+// a live agent into whatever context that session last held, and a typo'd
+// name silently forked a blank same-named terminal.
+function refuseLauncher(rawName) {
+  // Recipes must be copy-pasteable: quote names with internal whitespace;
+  // a name that normalizes to empty gets the <name> placeholder.
+  const name = normalizeName(rawName);
+  const arg = !name ? "<name>" : /\s/.test(name) ? JSON.stringify(name) : name;
+  console.error(
+    `Error: the 'pi-link <name>' launcher was removed (ADR-0007) — launching is explicit.`,
+  );
+  console.error("");
+  console.error(`  Fresh start:  pi --link --link-name ${arg}`);
+  console.error(`  Resurrect:    pi-link --resolve ${arg} -g`);
+  console.error("                then: pi --link --session <printed path>");
   process.exit(1);
 }
 
@@ -278,10 +277,13 @@ function fail(msg) {
 }
 
 function printHelp() {
-  console.error("Usage: pi-link <name> [--global|-g] [pi flags...]");
-  console.error("       pi-link --list [--global|-g]");
+  console.error("Usage: pi-link --list [--global|-g]");
   console.error("       pi-link --resolve <name> [--global|-g]");
   console.error("       pi-link --version");
+  console.error("");
+  console.error("Query-only CLI — launching is explicit (ADR-0007):");
+  console.error("  Fresh start:  pi --link --link-name <name>");
+  console.error("  Resurrect:    pi --link --session <path>  (path via pi-link --resolve <name> -g)");
   console.error("");
   console.error("By default, name lookup is scoped to the current cwd.");
   console.error("--global / -g widens the search to sessions in any cwd.");
@@ -304,7 +306,6 @@ function describeMode(mode) {
     case "version": return "--version";
     case "list": return "--list";
     case "resolve": return "--resolve";
-    case "launcher": return "session name";
     default: return mode;
   }
 }
@@ -312,18 +313,16 @@ function describeMode(mode) {
 // ── Parser ─────────────────────────────────────────────────────────────────
 //
 // Single sequential pass populates `state`; dispatcher reads it. Phases:
-//   1. Global flags (--global, --help, --version, --)
+//   1. Global flags (--global, --help, --version)
 //   2. Mode-selecting flags (--list, --resolve, --resolve=<name>)
 //   3. Mode-specific extra-token rejection
-//   4. Launcher mode entry (mode null + bare positional)
-//   5. Launcher passthrough (mode launcher) with orphan-positional rejection
+//   4. Anything else: unknown flag → error; bare positional → launcher
+//      refusal with the explicit recipes (ADR-0007 §8)
 
 const state = {
-  mode: null, // null | "help" | "version" | "list" | "resolve" | "launcher"
+  mode: null, // null | "help" | "version" | "list" | "resolve"
   resolveName: null,
-  launcherName: null,
   global: false,
-  piPassthrough: [],
 };
 
 function setMode(mode) {
@@ -333,15 +332,12 @@ function setMode(mode) {
   state.mode = mode;
 }
 
-let lastWasFlag = false;
-
 for (let i = 0; i < rawArgs.length; i++) {
   const a = rawArgs[i];
 
   // Phase 1: global flags / scope-affecting tokens.
   if (a === "--global" || a === "-g") {
     state.global = true;
-    lastWasFlag = false;
     continue;
   }
   if (a === "--help" || a === "-h") {
@@ -352,18 +348,6 @@ for (let i = 0; i < rawArgs.length; i++) {
     setMode("version"); // errors if combined with another mode
     continue;
   }
-  if (a === "--") {
-    // `--` only meaningful in launcher mode (separates pi flags from positionals).
-    if (state.mode !== "launcher") {
-      fail(`-- is only valid after a session name`);
-    }
-    for (let j = i + 1; j < rawArgs.length; j++) {
-      state.piPassthrough.push(rawArgs[j]);
-    }
-    i = rawArgs.length;
-    break;
-  }
-
   // Phase 2: mode-selecting flags.
   if (a === "--list") {
     setMode("list");
@@ -401,37 +385,15 @@ for (let i = 0; i < rawArgs.length; i++) {
     fail(`--resolve accepts exactly one name; got extra: ${a}`);
   }
 
-  // Phase 4: launcher mode entry. state.mode === null here, no name set yet.
-  // (lastWasFlag is still false here — only Phase 5 sets it, and Phase 5 requires launcher mode.)
-  if (state.mode === null) {
-    rejectManagedFlag(a);
-    if (a.startsWith("-")) {
-      fail(`Unknown argument: ${a}\n  Usage: pi-link <name> [--global|-g] [pi flags...]`);
-    }
-    if (a === "list" || a === "resolve") {
-      fail(`'pi-link ${a}' was removed. Use 'pi-link --${a}'.`);
-    }
-    state.mode = "launcher";
-    state.launcherName = a;
-    continue;
-  }
-
-  // Phase 5: launcher mode, name set. Tokens go to passthrough or get rejected.
-  rejectManagedFlag(a);
+  // Phase 4: nothing else is valid. state.mode === null here (query modes
+  // reject their own extra tokens in Phase 3).
   if (a.startsWith("-")) {
-    state.piPassthrough.push(a);
-    // `--key=value` is self-contained; only `--key` (without `=`) might consume
-    // the next token as its value.
-    lastWasFlag = !a.includes("=");
-    continue;
+    fail(`Unknown argument: ${a}\n  Usage: pi-link --list [--global|-g] | pi-link --resolve <name> [--global|-g]`);
   }
-  // Bare positional: allowed only if it follows a flag without `=`.
-  if (lastWasFlag) {
-    state.piPassthrough.push(a);
-    lastWasFlag = false;
-    continue;
+  if (a === "list" || a === "resolve") {
+    fail(`'pi-link ${a}' was removed. Use 'pi-link --${a}'.`);
   }
-  fail(`Unexpected argument after session name: ${a}\n  Use -- to pass positional arguments to pi.`);
+  refuseLauncher(a); // exits 1 with the explicit recipes
 }
 
 // ── Post-parse validation ──────────────────────────────────────────────────
@@ -445,13 +407,6 @@ if (state.mode === "resolve") {
     fail(`--resolve requires a non-empty name argument.\n  Usage: pi-link --resolve <name> [--global|-g]`);
   }
   state.resolveName = normalized;
-}
-if (state.mode === "launcher") {
-  const normalized = normalizeName(state.launcherName);
-  if (!normalized) {
-    fail(`session name cannot be empty.\n  Usage: pi-link <name> [--global|-g] [pi flags...]`);
-  }
-  state.launcherName = normalized;
 }
 
 // ── Dispatch ───────────────────────────────────────────────────────────────
@@ -472,9 +427,6 @@ switch (state.mode) {
   case "resolve":
     await runResolve(state);
     break;
-  case "launcher":
-    await runLauncher(state);
-    break;
   default:
     fail(`internal error: unknown mode ${state.mode}`);
 }
@@ -486,7 +438,7 @@ async function runList(state) {
   const sessions = await listSessions({ all: state.global, dir, isCustom });
   if (sessions.length === 0) {
     console.log(state.global ? "No pi-link sessions found." : "No pi-link sessions found in this cwd.");
-    console.log("Start one: pi-link <name>");
+    console.log("Start one: pi --link --link-name <name>");
     return;
   }
   const columns = state.global
@@ -506,7 +458,7 @@ async function runList(state) {
   console.log(renderTable(sessions, columns));
   if (process.stdout.isTTY) {
     console.log("");
-    console.log(dim("Resume: pi-link <name>"));
+    console.log(dim("Resurrect: pi --link --session <path>  (path via pi-link --resolve <name> -g)"));
   }
 }
 
@@ -528,46 +480,4 @@ async function runResolve(state) {
     console.error(`(${all.length} match${all.length === 1 ? "" : "es"} in other cwds — try --global to consider ${all.length === 1 ? "it" : "them"}.)`);
   }
   process.exit(2);
-}
-
-async function runLauncher(state) {
-  const name = state.launcherName; // already normalized
-  const { dir, isCustom } = resolveSessionDir(process.cwd(), resolveAgentDir());
-  const { local, all } = await findSessionsByName(name, dir, isCustom);
-  const matches = state.global ? all : local;
-  if (matches.length > 1) {
-    printCandidates(name, matches);
-  }
-
-  const piArgs = [];
-  if (matches.length === 1) {
-    console.error(`Resuming session: ${matches[0].path}`);
-    piArgs.push("--session", matches[0].path);
-  } else {
-    if (!state.global && all.length > local.length) {
-      const elsewhere = all.length - local.length;
-      console.error(`No "${name}" in this cwd. (${elsewhere} match${elsewhere === 1 ? "" : "es"} in other cwds — use --global to consider ${elsewhere === 1 ? "it" : "them"}.)`);
-    }
-    console.error("Starting new session.");
-  }
-  piArgs.push("--link", ...state.piPassthrough);
-
-  const isWin = process.platform === "win32";
-  const cmd = isWin ? "cmd.exe" : "pi";
-  const cmdArgs = isWin ? ["/d", "/c", "pi", ...piArgs] : piArgs;
-
-  // PI_LINK_NAME is the internal handoff to the pi-link extension on the Pi side.
-  // The extension consumes and deletes it on startup; never expose this as a public API.
-  const child = spawn(cmd, cmdArgs, {
-    stdio: "inherit",
-    env: { ...process.env, PI_LINK_NAME: name },
-  });
-  child.once("exit", (code, signal) => {
-    if (code !== null) process.exit(code);
-    process.exit(signal === "SIGINT" ? 130 : 1);
-  });
-  child.once("error", (err) => {
-    console.error(`Failed to start pi: ${err.message}`);
-    process.exit(1);
-  });
 }

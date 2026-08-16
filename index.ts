@@ -2,7 +2,7 @@
  * Pi Link — WebSocket-based inter-terminal communication
  *
  * Connects multiple Pi terminals over a local WebSocket link.
- * Opt-in via --link flag, --link-name flag, pi-link CLI, or /link-connect command.
+ * Opt-in via --link flag, --link-name flag, or /link-connect command.
  * First terminal to connect becomes the hub; others join as clients.
  * Hub loss triggers automatic promotion of a surviving client.
  *
@@ -2265,28 +2265,21 @@ export default function (pi: ExtensionAPI) {
     currentCwd = _ctx.cwd;
 
     // Resolve terminal name. Precedence:
-    //   --link-name flag  >  PI_LINK_NAME env  >  saved link-name  >  session name  >  random
+    //   --link-name flag  >  saved link-name  >  session name  >  random
     //
-    // --link-name is the public CLI surface (link identity only, never touches session name).
-    // PI_LINK_NAME is the internal handoff from the `pi-link` wrapper, which DOES
-    // seed session name when absent (the wrapper's combined-mode contract).
-    // PI_LINK_NAME is consumed once and removed from process.env so spawned children don't inherit it.
+    // --link-name is the public CLI surface (link identity only, never
+    // touches session name). The wrapper's env-var name handoff is retired
+    // with the launcher's execution mode (ADR-0007 §8, #16) — no env path
+    // seeds link identity.
     const cliRaw = pi.getFlag("link-name");
-    let cliFlagName: string | undefined;
+    let flagName: string | undefined;
     if (typeof cliRaw === "string") {
-      cliFlagName = normalizeName(cliRaw);
-      if (!cliFlagName) {
+      flagName = normalizeName(cliRaw);
+      if (!flagName) {
         console.error("Error: --link-name requires a non-empty value.");
         process.exit(1);
       }
     }
-
-    const envRaw = process.env.PI_LINK_NAME;
-    delete process.env.PI_LINK_NAME;
-    const envFlagName = normalizeName(envRaw);
-
-    const flagName = cliFlagName ?? envFlagName;
-    const fromEnv = !cliFlagName && !!envFlagName;
 
     if (flagName) {
       preferredName = flagName;
@@ -2303,10 +2296,6 @@ export default function (pi: ExtensionAPI) {
       if (normalizeName(latestSaved) !== flagName) {
         pi.appendEntry("link-name", { name: flagName });
       }
-
-      // Critical: only the env path (wrapper combined mode) seeds session name.
-      // Public --link-name is link-only.
-      if (fromEnv && !pi.getSessionName()) pi.setSessionName(flagName);
     } else {
       const saved = latestCustomData("link-name") as
         | { name?: unknown }

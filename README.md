@@ -53,9 +53,9 @@ pi install npm:pi-link
 
 That's it. For most users this is all you need.
 
-#### Optional: shell launcher
+#### Optional: query CLI
 
-If you also want the `pi-link <name>` shell command to start named sessions from a terminal prompt (e.g. `pi-link builder` in one window, `pi-link reviewer` in another), install the CLI globally as well:
+If you also want the `pi-link` shell command to discover sessions from a terminal prompt (`pi-link --list`, `pi-link --resolve <name>` — the resurrection lookup), install the CLI globally as well:
 
 ```bash
 npm i -g pi-link
@@ -67,13 +67,13 @@ Or install both in one line:
 pi install npm:pi-link && npm i -g pi-link
 ```
 
-The shell launcher is convenience-only — you can always reach the same functionality from inside Pi via `/link-connect` and `/link-name <name>`.
+The CLI is query-only (ADR-0007): it lists and resolves sessions but never launches Pi. Launching is explicit — see [Explicit launch & resurrection](#explicit-launch--resurrection).
 
 ### Uninstall
 
 ```bash
 pi uninstall npm:pi-link      # Remove Pi extension
-npm uninstall -g pi-link      # Remove CLI launcher (if you installed it)
+npm uninstall -g pi-link      # Remove query CLI (if you installed it)
 ```
 
 ### Usage
@@ -81,15 +81,15 @@ npm uninstall -g pi-link      # Remove CLI launcher (if you installed it)
 Link is **off by default**. Two ways to start:
 
 ```bash
-pi --link            # try it now, random name like t-a3f9
-pi-link mybot        # named session you can resume by name
+pi --link                  # try it now, random name like t-a3f9
+pi --link --link-name mybot  # fresh start with a stable link name
 ```
 
-Already in a session? Use `/link-connect`. Use `/link` any time to check status, or let the LLM tools handle cross-terminal coordination. See [Session Resume](#session-resume) for `pi-link <name>` details.
+Already in a session? Use `/link-connect`. Use `/link` any time to check status, or let the LLM tools handle cross-terminal coordination. See [Explicit launch & resurrection](#explicit-launch--resurrection) for resurrecting a terminal.
 
 ### Notes on installation
 
-**Why two installs?** Pi 0.75 installs Pi packages into a private npm root (`~/.pi/agent/npm/`) for safer permission handling ([pi-mono#4587](https://github.com/earendil-works/pi-mono/issues/4587)). That's where the Pi extension lives, but it means the `pi-link` shell command is no longer on system PATH. `npm i -g pi-link` puts it on PATH separately. Both installs are safe to use together.
+**Why two installs?** Pi 0.75 installs Pi packages into a private npm root (`~/.pi/agent/npm/`) for safer permission handling ([pi-mono#4587](https://github.com/earendil-works/pi-mono/issues/4587)). That's where the Pi extension lives, but it means the `pi-link` query CLI is no longer on system PATH. `npm i -g pi-link` puts it on PATH separately. Both installs are safe to use together.
 
 ---
 
@@ -145,50 +145,51 @@ Every other terminal sees:
 
 ## Configuration
 
-Link is **off by default**. Without `--link`, `--link-name`, or `pi-link`, the extension is completely silent — no status bar, no connections, no warnings.
+Link is **off by default**. Without `--link` or `--link-name`, the extension is completely silent — no status bar, no connections, no warnings.
 
 **Naming concepts**
 
 - **link name** — identity used on the network (visible in `link_list`, `/link`, prompts).
 - **Pi session name** — identity Pi gives the session itself; lives in the session JSONL's latest `session_info` entry.
-- **saved link name** — the link name persisted to the session, restored on resume. Set by `/link-name`, `pi-link <name>`, or `pi --link-name <name>`.
+- **saved link name** — the link name persisted to the session, restored on resume. Set by `/link-name` or `pi --link-name <name>`.
 - **`--link-name` flag vs `/link-name` command** — same concept (the link name) at different times (startup vs mid-session).
 
-| What you want                        | Use                     |
-| ------------------------------------ | ----------------------- |
-| Resume/create a named session        | `pi-link <name>`        |
-| Stable link identity, normal Pi flow | `pi --link-name <name>` |
-| Quick try, random name               | `pi --link`             |
-| Already in a session                 | `/link-connect`         |
-| Disconnect mid-session               | `/link-disconnect`      |
+| What you want                        | Use                                              |
+| ------------------------------------ | ------------------------------------------------ |
+| Fresh named terminal                 | `pi --link --link-name <name>`                   |
+| Resurrect a terminal by name         | `pi-link --resolve <name> -g` → `pi --link --session <path>` |
+| Quick try, random name               | `pi --link`                                      |
+| Already in a session                 | `/link-connect`                                  |
+| Disconnect mid-session               | `/link-disconnect`                               |
 
-`pi-link <name>` resumes/creates a session AND sets your link identity in one step. `pi --link-name <name>` sets only the link identity, leaving Pi's normal session selection (latest in cwd, or fresh) untouched.
+`pi --link-name <name>` sets only the link identity, leaving Pi's normal session selection (latest in cwd, or fresh) untouched.
 
 **Name normalization:** Link names are normalized — leading/trailing whitespace removed and internal whitespace runs collapsed to a single space. `/link-name "build   lead"` saves and shows as `build lead`.
 
-**Name precedence:** `pi --link-name` > `pi-link <name>` > saved `/link-name` > Pi session name > random `t-xxxx`. _(The `pi-link` wrapper itself does not accept `--link-name`; pick one or the other.)_
+**Name precedence:** `pi --link-name` > saved `/link-name` > Pi session name > random `t-xxxx`.
 
 `/link-connect` and `/link-disconnect` save their intent to the session — resume later and the connection state is restored without needing the flag. Explicit user intent takes precedence over `--link`.
 
 Once connected, terminals discover each other on `127.0.0.1:9900`. See [Limitations](#limitations--design-decisions) for the hardcoded port.
 
-### Session Resume
+### Explicit launch & resurrection
 
-Pi's `--session` flag requires a file path, not a display name. `pi-link` bridges this — it resolves a session by name and launches Pi directly:
+The launcher execution mode is retired (ADR-0007 §8): `pi-link <name>` no longer resolves, resumes, or spawns anything — it exits non-zero with the recipes below. Implicit resume dropped a live agent into whatever context that session last held, and a typo'd name silently created a blank same-named terminal.
+
+**Fresh start** (link identity only; Pi's normal session selection untouched):
 
 ```bash
-pi-link worker-1                # resume or create session "worker-1"
-pi-link worker-1 --model sonnet # with extra Pi flags
+pi --link --link-name worker-1
 ```
 
-How it works: `pi-link worker-1` scans Pi's session directory, finds the session named "worker-1", and spawns `pi --session <path> --link`. Session-dir resolution matches Pi's lookup order: `PI_CODING_AGENT_SESSION_DIR` env > `<cwd>/.pi/settings.json` `sessionDir` > `<agentDir>/settings.json` `sessionDir` > default `<agentDir>/sessions/`. `<agentDir>` follows `PI_CODING_AGENT_DIR` and defaults to `~/.pi/agent/`.
+**Resurrect** an existing terminal — explicit two-step: look up the session, then resume it by path:
 
-Lookup is **scoped to the current cwd by default**; pass `--global` (`-g`) to consider sessions in any cwd.
+```bash
+pi-link --resolve worker-1 -g   # prints the session file path
+pi --link --session <printed path>
+```
 
-- **One match in scope** → resumes that session
-- **No match in scope** → creates a new session in the current cwd. If matches exist outside the scope, prints a hint pointing at `--global`.
-- **Multiple matches in scope** → prints candidates to stderr, exits 1
-- **Conflicting flags** (`--session`, `--continue`, `--resume`, `--fork`, etc.) → rejected with an error
+Session-dir resolution matches Pi's lookup order: `PI_CODING_AGENT_SESSION_DIR` env > `<cwd>/.pi/settings.json` `sessionDir` > `<agentDir>/settings.json` `sessionDir` > default `<agentDir>/sessions/`. `<agentDir>` follows `PI_CODING_AGENT_DIR` and defaults to `~/.pi/agent/`.
 
 ### Discovering sessions
 
@@ -200,7 +201,7 @@ NAME             MODIFIED  MESSAGES  ID
 opus@pi-link     2m ago    4632      6332faab
 gpt@pi-link      5m ago    1493      20d43841
 
-Resume: pi-link <name>
+Resurrect: pi --link --session <path>  (path via pi-link --resolve <name> -g)
 ```
 
 With `--global`:
@@ -211,12 +212,12 @@ NAME             CWD                   MODIFIED  MESSAGES  ID
 opus@pi-link     ~/my-project          2m ago    4632      6332faab
 gpt@pi-link      ~/other-project       5m ago    1493      20d43841
 
-Resume: pi-link <name>
+Resurrect: pi --link --session <path>  (path via pi-link --resolve <name> -g)
 ```
 
 `--global` adds a `CWD` column with `~` substituted for `$HOME`. Output is plain when piped (`NO_COLOR` honored).
 
-`pi-link <name>` and `pi-link --resolve <name>` follow the same scoping: local cwd by default, `--global` (or `-g`) widens. When `pi-link <name>` finds no local match but matches exist elsewhere, it warns and points at `--global` instead of silently jumping cwds.
+`pi-link --resolve <name>` follows the same scoping: local cwd by default, `--global` (or `-g`) widens. When it finds no local match but matches exist elsewhere, it points at `--global` instead of silently jumping cwds.
 
 For scripting, `pi-link --resolve <name>` prints just the session path (machine-readable, no other output). Exit codes: `0` on single match, `1` if ambiguous (multiple matches printed to stderr), `2` if not found.
 
