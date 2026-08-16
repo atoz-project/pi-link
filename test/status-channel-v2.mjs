@@ -9,8 +9,21 @@
 
 process.env.PI_LINK_PORT ||= "19902"; // isolated test fleet port (before import)
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import { setTimeout as delay } from "node:timers/promises";
+
+// #15 item 8: profiles-file path knob (before import). Scenario 2 redirects
+// a client to the pre-gate hub via a profile + PI_LINK_PROFILE (PI_LINK_URL
+// is retired). No `default` key, so every other terminal resolves loopback.
+const PROFILES_FILE = join(
+  mkdtempSync(join(tmpdir(), "pi-link-v2-test-")),
+  "pi-link.json",
+);
+process.env.PI_LINK_PROFILES_FILE = PROFILES_FILE;
+
 const { default: createLink } = await import("../index.ts");
 
 const PORT = 19902;
@@ -196,7 +209,11 @@ gateHub.on("connection", (sock) => {
   });
 });
 
-process.env.PI_LINK_URL = `ws://127.0.0.1:${GATE_PORT}`;
+writeFileSync(
+  PROFILES_FILE,
+  JSON.stringify({ profiles: { gatehub: { url: `ws://127.0.0.1:${GATE_PORT}` } } }),
+);
+process.env.PI_LINK_PROFILE = "gatehub";
 const gated = await startTerminal({ link: true, "link-name": "gated" });
 await waitFor(() => gateRegisters === 1, "register on pre-gate hub");
 await waitFor(
@@ -215,7 +232,7 @@ assert(
 await gated.commands["link-connect"].handler("", gated.ctx);
 await waitFor(() => gateRegisters === 2, "manual retry after refusal");
 assert(true, "/link-connect retries after version refusal");
-delete process.env.PI_LINK_URL;
+delete process.env.PI_LINK_PROFILE;
 await gated.handlers.session_shutdown();
 gateHub.close();
 

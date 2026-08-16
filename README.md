@@ -229,9 +229,9 @@ By default the hub binds `127.0.0.1:9900` (loopback, unauthenticated). To span m
 | Env | Role | Default |
 | --- | --- | --- |
 | `PI_LINK_HOST` | hub bind host | `127.0.0.1` |
-| `PI_LINK_URL` | client hub URL (`ws://` or `wss://`) | `ws://127.0.0.1:9900` |
-| `PI_LINK_PORT` | hub bind port + default client URL port (test/fleet isolation) | `9900` |
-| `PI_LINK_PROFILE` | explicit profile selection | unset |
+| `PI_LINK_PORT` | hub bind port + default loopback dial port (test/fleet isolation) | `9900` |
+| `PI_LINK_PROFILE` | explicit profile selection (a profile *name*, never a URL) | unset |
+| `PI_LINK_PROFILES_FILE` | profiles file *path* (test isolation) | `~/.pi/agent/pi-link.json` |
 
 **Profiles file** `~/.pi/agent/pi-link.json` (mode `0600`) — the **only** token source (env vars are visible in `ps`; user ruling). Shape:
 
@@ -244,17 +244,21 @@ By default the hub binds `127.0.0.1:9900` (loopback, unauthenticated). To span m
 }
 ```
 
-Selection: `PI_LINK_PROFILE` > profile whose `url` matches `PI_LINK_URL` > `default` > none. `none` (loopback, no profile) is byte-identical to pre-ADR-0002 behavior — opt-in, upstream-friendly.
+**The profile is the dial target (ADR-0007).** A profile is a complete fleet membership declaration: *where to dial* (`url`; omitted = `ws://127.0.0.1:$PI_LINK_PORT`) and *what ticket to carry* (`token`). One resolved profile answers both. Selection: `PI_LINK_PROFILE` > `default` > none. Env selects a profile *name*; it never carries a URL (`PI_LINK_URL` is retired — ambient naked-URL dialing is how fleets silently split). `none` (no profiles file / no `default`) is loopback, unauthenticated — byte-identical zero-config behavior, opt-in, upstream-friendly.
 
-**Fail-closed.** A non-loopback bind (`PI_LINK_HOST` not in `127.0.0.1`/`localhost`/`::1`; `127.0.0.2` counts as non-loopback) without a resolvable token refuses to start with an explicit reason — an unauthenticated public bind is not an allowed state.
+**Unknown profile fails closed.** A selected name that does not resolve (a `PI_LINK_PROFILE` typo, a dangling `default`) is a loud refusal: no dial, no promotion, no auto-reconnect. Fix the config, then `/link-connect` (same latch family as auth/workspace/version rejection).
+
+**Hub machine setup.** `default` answers "where is my fleet?" — on the machine that hosts the hub, the answer is *here*: point `default` at a loopback profile carrying the fleet token (`url` omitted). Its terminals dial loopback; the first one promotes and binds per `PI_LINK_HOST` (bind stays env — a deployment fact of one process, not a membership fact of the machine). Member machines point their `default` at the public URL. A hub machine whose `default` dialed its own public address could never self-bootstrap after an outage — non-loopback never promotes.
+
+**Fail-closed.** A non-loopback bind (`PI_LINK_HOST` not in `127.0.0.1`/`localhost`/`::1`; `127.0.0.2` counts as non-loopback) without a resolvable token refuses to start with an explicit reason — an unauthenticated public bind is not an allowed state. The refusal fires **once** (no retry storm every 2–5s); `/link-connect` retries after the config is fixed.
 
 **Hub auth.** With a token resolved, `register` is verified via `sha256(token)` digests compared with `crypto.timingSafeEqual` (digest both sides — equalizes length; the token itself is never logged). Mismatch/missing → hub replies an error, closes the socket, and notifies locally with the source address. Loopback clients authenticate too (one code path).
 
 **Auth rejection vs hub loss.** The client sets an `authFailed` flag on rejection and **stops** auto-reconnect (a wrong-token terminal would otherwise hammer the hub every 2s), notifying clearly and pointing at the profiles file; `/link-connect` resets it. Hub loss keeps today's retry-with-backoff.
 
-**No cross-machine promotion (B6).** A client whose URL is non-loopback never runs `startHub` — hub loss means reconnect-with-backoff only. Otherwise one outage splits the fleet into per-machine islands that all look healthy.
+**No cross-machine promotion (B6).** A client whose resolved profile URL is non-loopback never runs `startHub` — hub loss means reconnect-with-backoff only. Otherwise one outage splits the fleet into per-machine islands that all look healthy. With config-first resolution, member machines of a remote fleet structurally cannot self-promote.
 
-**Transport encryption.** TLS termination belongs to the deployment edge (certificate lifecycle does not belong in a single-file extension). `PI_LINK_URL` accepts `wss://` natively (Node's ws client speaks TLS). Sending a token over plaintext `ws://` to a non-loopback host produces one warning per session but is not blocked — policy belongs to operators, mechanism to code.
+**Transport encryption.** TLS termination belongs to the deployment edge (certificate lifecycle does not belong in a single-file extension). The profile `url` accepts `wss://` natively (Node's ws client speaks TLS). Sending a token over plaintext `ws://` to a non-loopback host produces one warning per session but is not blocked — policy belongs to operators, mechanism to code.
 
 Minimal reverse-proxy TLS SOP (caddy):
 
@@ -262,7 +266,7 @@ Minimal reverse-proxy TLS SOP (caddy):
 caddy reverse-proxy --from hub.example:9900 --to 127.0.0.1:9900
 ```
 
-With cloudflared: publish the local `9900` port through a named tunnel and point `PI_LINK_URL` at the tunnel's `wss://` hostname.
+With cloudflared: publish the local `9900` port through a named tunnel and point the member machines' profile `url` at the tunnel's `wss://` hostname.
 
 **Mixed-version rule.** `register` carries an optional `token` field (old hubs ignore unknown fields). Upgrade all terminals before enabling auth so a mix of old (unauthenticated) and new (token-expected) hubs doesn't fragment the fleet.
 

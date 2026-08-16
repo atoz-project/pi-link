@@ -10,8 +10,21 @@
 
 process.env.PI_LINK_PORT ||= "19901"; // isolated test fleet port (before import)
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import { setTimeout as delay } from "node:timers/promises";
+
+// #15 item 8: profiles-file path knob (before import). Scenario 2 redirects
+// a client to the old hub via a profile + PI_LINK_PROFILE (PI_LINK_URL is
+// retired). No `default` key, so every other terminal resolves loopback.
+const PROFILES_FILE = join(
+  mkdtempSync(join(tmpdir(), "pi-link-ws-test-")),
+  "pi-link.json",
+);
+process.env.PI_LINK_PROFILES_FILE = PROFILES_FILE;
+
 const { default: createLink } = await import("../index.ts");
 
 const PORT = 19901;
@@ -244,7 +257,11 @@ oldHub.on("connection", (sock) => {
   });
 });
 
-process.env.PI_LINK_URL = `ws://127.0.0.1:${OLD_PORT}`;
+writeFileSync(
+  PROFILES_FILE,
+  JSON.stringify({ profiles: { oldhub: { url: `ws://127.0.0.1:${OLD_PORT}` } } }),
+);
+process.env.PI_LINK_PROFILE = "oldhub";
 const scoped = await startTerminal({
   link: true,
   "link-name": "scoped",
@@ -274,7 +291,7 @@ assert(
 await scoped.commands["link-connect"].handler("", scoped.ctx);
 await waitFor(() => oldHubRegisters === 2, "manual reconnect retry");
 assert(true, "/link-connect retries after refusal");
-delete process.env.PI_LINK_URL;
+delete process.env.PI_LINK_PROFILE;
 await scoped.handlers.session_shutdown();
 
 oldHub.close();

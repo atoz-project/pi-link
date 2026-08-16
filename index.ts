@@ -17,6 +17,7 @@ import type {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import * as os from "node:os";
 
 import { WebSocket, WebSocketServer } from "ws";
@@ -59,8 +60,13 @@ const NEW_TIMEOUT_MS = 30_000;
 // which also makes the fail-closed / no-self-promotion guards testable without
 // a real external interface. Profiles file is the only token source
 // (~/.pi/agent/pi-link.json, mode 0600); no env-var token override.
+// #15 item 8: PI_LINK_PROFILES_FILE overrides the file PATH (test-isolation
+// knob, same category as PI_LINK_PORT — carries a path, not a URL fact).
+// Read once at module load.
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const PROFILES_FILE_PATH = (() => {
+  const override = process.env.PI_LINK_PROFILES_FILE;
+  if (override) return override;
   const home = os.homedir().replace(/\\/g, "/");
   return `${home}/.pi/agent/pi-link.json`;
 })();
@@ -296,6 +302,16 @@ export default function (pi: ExtensionAPI) {
   // missing/mismatched, or the hub sent a version-rejection error before
   // close). Same semantics as authFailed; manual /link-connect resets.
   let versionRejected = false;
+  // ADR-0007: set when the selected profile name (PI_LINK_PROFILE or the
+  // file's default) does not resolve. Fails closed: no dial, no promotion,
+  // no auto-reconnect — falling through to loopback on a typo would be the
+  // 2026-08-17 fleet split with a different spelling. /link-connect resets.
+  let profileUnresolved = false;
+  // #7 item 1: set when startHub refused a non-loopback bind without a
+  // token. Fail once, loudly; without the latch initialize() falls through
+  // to scheduleReconnect and re-refuses every 2–5s forever. /link-connect
+  // resets.
+  let hubConfigFailed = false;
 
   // Status tracking (local truth)
   let agentRunning = false;
@@ -451,13 +467,17 @@ export default function (pi: ExtensionAPI) {
     return { kind: "idle", since: stateSince };
   }
 
-  // ── ADR-0002 config resolution ────────────────────────────────────────
+  // ── ADR-0007 config-first dial resolution (amends ADR-0002) ────────────
   //
-  // Three env + one profiles file (~/.pi/agent/pi-link.json, 0600). The file
-  // is the ONLY token source (user ruling: no env-var token override — env
-  // is visible in ps). Selection chain:
-  //   PI_LINK_PROFILE > profile whose url matches PI_LINK_URL > default > none
-  // none (loopback, no token) = byte-identical to pre-ADR-0002 behavior.
+  // One profiles file (PROFILES_FILE_PATH, 0600) — the ONLY token source
+  // (user ruling: no env-var token override — env is visible in ps). A
+  // profile is a complete fleet membership declaration: where to dial
+  // (url; omitted = loopback) and what ticket to carry (token). Selection
+  // chain: PI_LINK_PROFILE > default > none. Env selects a NAME; it never
+  // carries the URL fact (PI_LINK_URL is retired — ambient naked-URL
+  // dialing was the 2026-08-17 fleet split's legal entrance).
+  // none (no file / no default) = loopback, no token — byte-identical
+  // zero-config behavior.
 
   interface ProfileEntry {
     url?: string;
@@ -470,7 +490,6 @@ export default function (pi: ExtensionAPI) {
 
   function loadProfilesFile(): ProfilesFile | null {
     try {
-      const fs = require("node:fs");
       if (!fs.existsSync(PROFILES_FILE_PATH)) return null;
       const raw = fs.readFileSync(PROFILES_FILE_PATH, "utf8");
       const parsed = JSON.parse(raw);
@@ -505,57 +524,37 @@ export default function (pi: ExtensionAPI) {
     return LOOPBACK_HOSTS.has(host);
   }
 
-  // Resolve the effective hub URL for THIS terminal (client path).
-  // PI_LINK_URL env, else default ws://127.0.0.1:9900 (today's behavior).
-  function resolveHubUrl(): string {
-    return process.env.PI_LINK_URL || `ws://127.0.0.1:${LINK_PORT}`;
-  }
-
   // Resolve hub bind host (hub path). PI_LINK_HOST env, else 127.0.0.1.
+  // Bind stays env: the hub is the passive side; the bind address is a
+  // deployment fact of one process, not a membership fact of the machine.
   function resolveHubHost(): string {
     return process.env.PI_LINK_HOST || "127.0.0.1";
   }
 
-  // Resolve the token + profile-selected URL for THIS terminal as a client.
-  // Returns { url, token } where token is null when no profile resolves
-  // (loopback default = unauthenticated). Never throws.
-  function resolveClientConfig(): { url: string; token: string | null } {
-    const envUrl = process.env.PI_LINK_URL;
-    const envProfile = process.env.PI_LINK_PROFILE;
+  // Resolve THIS machine's profile: dial target + ticket, both from the one
+  // chosen profile. A selected name (PI_LINK_PROFILE or the file's default)
+  // that does not resolve fails CLOSED — the caller must not dial (a typo
+  // falling through to loopback would self-promote and split the fleet).
+  // No selection = implicit local profile (loopback, no token). Never throws.
+  function resolveClientConfig():
+    | { url: string; token: string | null }
+    | { unresolved: string } {
     const profiles = loadProfilesFile();
-    const url = resolveHubUrl();
-
-    let chosen: ProfileEntry | undefined;
-    // 1. PI_LINK_PROFILE explicit
-    if (envProfile && profiles?.profiles?.[envProfile])
-      chosen = profiles.profiles[envProfile];
-    // 2. profile whose url matches PI_LINK_URL
-    if (!chosen && envUrl && profiles?.profiles) {
-      for (const [, p] of Object.entries(profiles.profiles)) {
-        if (p.url && urlHost(p.url) === urlHost(envUrl) && p.url === envUrl)
-          chosen = p;
-      }
-    }
-    // 3. default
-    if (!chosen && profiles?.default && profiles.profiles?.[profiles.default])
-      chosen = profiles.profiles[profiles.default];
-
-    const token = chosen?.token ?? null;
-    return { url, token };
+    const selected = process.env.PI_LINK_PROFILE || profiles?.default;
+    if (!selected) return { url: `ws://127.0.0.1:${LINK_PORT}`, token: null };
+    const chosen = profiles?.profiles?.[selected];
+    if (!chosen) return { unresolved: selected };
+    return {
+      url: chosen.url ?? `ws://127.0.0.1:${LINK_PORT}`,
+      token: chosen.token ?? null,
+    };
   }
 
-  // Resolve the token for the hub (this machine binds). Used for fail-closed
-  // check + register verification. Token from profiles file only; env override
-  // deliberately absent (user ruling). Returns null when no profile resolves.
+  // Token for the hub (this machine binds): the same one-profile resolution.
+  // Unresolved → null (the fail-closed bind check then refuses non-loopback).
   function resolveHubToken(): string | null {
-    const profiles = loadProfilesFile();
-    const envProfile = process.env.PI_LINK_PROFILE;
-    let chosen: ProfileEntry | undefined;
-    if (envProfile && profiles?.profiles?.[envProfile])
-      chosen = profiles.profiles[envProfile];
-    if (!chosen && profiles?.default && profiles.profiles?.[profiles.default])
-      chosen = profiles.profiles[profiles.default];
-    return chosen?.token ?? null;
+    const cfg = resolveClientConfig();
+    return "unresolved" in cfg ? null : cfg.token;
   }
 
   // sha256 digest of a token, as a 32-byte Buffer. Used for timing-safe
@@ -1917,7 +1916,9 @@ export default function (pi: ExtensionAPI) {
       if (!isLoopbackHost(bindHost)) {
         const token = resolveHubToken();
         if (!token) {
-          const reason = `Refusing to start hub on non-loopback ${bindHost}:${LINK_PORT} — no token resolvable in ${PROFILES_FILE_PATH}. Set a profile token before exposing the hub.`;
+          // #7 item 1: latch — fail once, loudly; /link-connect retries.
+          hubConfigFailed = true;
+          const reason = `Refusing to start hub on non-loopback ${bindHost}:${LINK_PORT} — no token resolvable in ${PROFILES_FILE_PATH}. Set a profile token before exposing the hub, then /link-connect.`;
           console.error(`Link: ${reason}`);
           notify(reason, "error");
           resolve(false);
@@ -1981,9 +1982,21 @@ export default function (pi: ExtensionAPI) {
 
   function connectAsClient(): Promise<boolean> {
     return new Promise((resolve) => {
-      // ADR-0002: connect to the resolved hub URL (ws:// or wss:// — the ws
-      // library speaks TLS natively). Token from profiles file only.
-      const { url, token } = resolveClientConfig();
+      // ADR-0007: the resolved profile answers both where to dial and what
+      // ticket to carry (ws:// or wss:// — the ws library speaks TLS
+      // natively). An unresolved selected profile fails closed: loud notify,
+      // no dial; initialize() then neither promotes nor reconnects.
+      const cfg = resolveClientConfig();
+      if ("unresolved" in cfg) {
+        profileUnresolved = true;
+        notify(
+          `Link profile "${cfg.unresolved}" does not resolve in ${PROFILES_FILE_PATH} — refusing to dial (no loopback fallback on a typo). Fix PI_LINK_PROFILE or the profiles file, then /link-connect.`,
+          "error",
+        );
+        resolve(false);
+        return;
+      }
+      const { url, token } = cfg;
       resolvedHubUrl = url;
       resolvedToken = token;
       const host = urlHost(url);
@@ -2103,16 +2116,18 @@ export default function (pi: ExtensionAPI) {
     // for THIS terminal's token; promoting would bind a hub the same token
     // can't satisfy — and the user must intervene). versionRejected joins
     // the guard (ADR-0005): a terminal the fleet refused for its version
-    // must not promote itself into a version-split hub.
+    // must not promote itself into a version-split hub. profileUnresolved
+    // joins too (ADR-0007): fail-closed means no dial AND no promotion.
     const hubHost = resolvedHubUrl ? urlHost(resolvedHubUrl) : null;
     const nonLoopback = hubHost ? !isLoopbackHost(hubHost) : false;
-    if (!nonLoopback && !authFailed && !versionRejected) {
+    if (!nonLoopback && !authFailed && !versionRejected && !profileUnresolved) {
       if (await startHub()) return;
     }
 
-    // Hub not reachable and we cannot (or must not) promote. Retry after delay.
-    if (authFailed || versionRejected) {
-      // Rejection: do not schedule reconnect (stops the hammer).
+    // Hub not reachable and we cannot (or must not) promote. Retry after
+    // delay — except on refusal latches (rejection ≠ hub loss; a config
+    // refusal re-firing every 2–5s would be a self-masking storm, #7).
+    if (authFailed || versionRejected || profileUnresolved || hubConfigFailed) {
       return;
     }
     scheduleReconnect();
@@ -3478,6 +3493,10 @@ export default function (pi: ExtensionAPI) {
       workspaceRejected = false;
       // ADR-0005: same reset for a refused protocol version.
       versionRejected = false;
+      // ADR-0007/#7: same reset for an unresolved profile or a refused hub
+      // bind (likely after fixing the profiles file or PI_LINK_HOST).
+      profileUnresolved = false;
+      hubConfigFailed = false;
       // Reset plaintext-warning so a new manual connect can re-fire it.
       plaintextWarningFired = false;
       await initialize();
