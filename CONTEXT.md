@@ -55,5 +55,26 @@ _Avoid_: account, credential
 **Trust domain**:
 One link/fleet. Membership confers full power over every member (a prompt
 executes a full agent turn with tools). Exactly one shared token per domain;
-no finer-grained authorization exists by design (ADR-0002).
+no finer-grained authorization exists by design (ADR-0002). Workspaces do
+not subdivide it — they are visibility, not authorization.
 _Avoid_: tenant, scope
+
+**Workspace**:
+An optional visibility group a terminal declares at startup
+(`--link-workspace` > `PI_LINK_WORKSPACE` > persisted session entry > none);
+fixed for the terminal's lifetime, never derived from cwd. One hub serves
+all workspaces; names stay globally unique (ADR-0004).
+_Avoid_: tenant, room, channel, project (the flag is per-terminal, not per-repo)
+
+**Global observer**:
+A terminal with no workspace. Its visible set is every terminal and it is in
+every terminal's visible set — pre-workspace behavior, and how fleet-level
+coordinators work with zero configuration (ADR-0004).
+_Avoid_: admin, superuser (it has no extra authority, only full visibility)
+
+**Visible set**:
+The universe one terminal can see and address: for a scoped terminal,
+same-workspace members ∪ global observers; for a global observer, everyone.
+Cuts every surface — welcome snapshot, joined/left, `link_list`, broadcast,
+status fan-out, direct addressing (cross-group = `not_found`) (ADR-0004).
+_Avoid_: filter, view
