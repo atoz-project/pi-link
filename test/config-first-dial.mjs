@@ -5,6 +5,9 @@
 // promotion / no reconnect; /link-connect retries), url-omitted loopback
 // profile with token (hub-machine doctrine), PI_LINK_URL ignored, remote
 // fleet member never self-promotes, and the #7 hubConfigFailed latch.
+// #19 extends it: --link-profile beats env/default, an unresolvable flag
+// name fails closed (+ /link-connect retry), the hub-bind token honors the
+// flag, and an empty flag value exits 1.
 //
 // Run: node test/config-first-dial.mjs
 
@@ -342,6 +345,163 @@ await waitFor(
 assert(true, "/link-connect retries after hubConfigFailed");
 delete process.env.PI_LINK_HOST;
 await t6.handlers.session_shutdown();
+
+// ── Scenario 7: --link-profile beats env and default (#19) ─────────────────
+
+console.log("scenario 7: --link-profile beats PI_LINK_PROFILE and default");
+
+writeFileSync(
+  PROFILES_FILE,
+  JSON.stringify({
+    profiles: {
+      envp: { url: "ws://127.0.0.1:19915", token: "tok-env" },
+      flagp: { url: "ws://127.0.0.1:19916", token: "tok-flag" },
+    },
+    default: "envp",
+  }),
+);
+const f7a = fakeHub(19915);
+const f7b = fakeHub(19916);
+process.env.PI_LINK_PROFILE = "envp";
+const t7 = await startTerminal({
+  link: true,
+  "link-name": "t7",
+  "link-profile": "flagp",
+});
+await waitFor(() => f7b.registers.length === 1, "register on the flag url");
+assert(
+  f7b.registers[0].token === "tok-flag",
+  "--link-profile dials its url with its token",
+);
+assert(
+  f7a.registers.length === 0,
+  "env- and default-selected profile never dialed",
+);
+delete process.env.PI_LINK_PROFILE;
+await t7.handlers.session_shutdown();
+f7a.server.close();
+f7b.server.close();
+
+// ── Scenario 8: unresolvable --link-profile fails closed (#19) ──────────────
+
+console.log("scenario 8: unknown --link-profile → fail closed; /link-connect retries");
+
+writeFileSync(
+  PROFILES_FILE,
+  JSON.stringify({ profiles: { real: { url: "ws://127.0.0.1:19914" } } }),
+);
+const t8 = await startTerminal({
+  link: true,
+  "link-name": "t8",
+  "link-profile": "typo",
+});
+await waitFor(
+  () =>
+    t8.notifications.find(
+      (n) => n.message.includes('"typo"') && n.message.includes("not resolve"),
+    ),
+  "fail-closed refusal notify",
+);
+assert(true, "unknown flag profile → loud refusal notify");
+await delay(5_500); // > one full backoff cycle
+const refusals8 = t8.notifications.filter((n) =>
+  n.message.includes("not resolve"),
+).length;
+assert(refusals8 === 1, `refusal fires once, no reconnect (${refusals8} notifies)`);
+assert(await dialFails(PORT), "no hub promoted on the loopback port");
+
+// Fix the config; /link-connect retries and dials the flag-named profile.
+const f8 = fakeHub(19917);
+writeFileSync(
+  PROFILES_FILE,
+  JSON.stringify({
+    profiles: { typo: { url: "ws://127.0.0.1:19917", token: "tok-typo" } },
+  }),
+);
+await t8.commands["link-connect"].handler("", t8.ctx);
+await waitFor(() => f8.registers.length === 1, "register after config fix");
+assert(
+  f8.registers[0].token === "tok-typo",
+  "/link-connect retries after the flag-named profile is fixed",
+);
+await t8.handlers.session_shutdown();
+f8.server.close();
+
+// ── Scenario 9: hub-bind token honors the flag (#19) ────────────────────────
+
+console.log("scenario 9: flag-selected url-omitted profile → loopback hub requires its token");
+
+writeFileSync(
+  PROFILES_FILE,
+  JSON.stringify({ profiles: { localf: { token: "flag-secret" } } }), // no default
+);
+const t9 = await startTerminal({
+  link: true,
+  "link-name": "hubf",
+  "link-profile": "localf",
+});
+await waitFor(
+  () =>
+    t9.notifications.find(
+      (n) =>
+        n.message.includes("Link hub started") &&
+        n.message.includes("auth: token required"),
+    ),
+  "loopback promotion with the flag profile's token",
+);
+assert(true, "resolveHubToken follows the flag tier");
+const good9 = await rawClient({ name: "g9", token: "flag-secret" });
+assert(good9.welcome.name === "g9", "register with the flag profile token welcomed");
+good9.ws.close();
+await t9.handlers.session_shutdown();
+
+// ── Scenario 10: empty --link-profile exits 1 (#19) ─────────────────────────
+
+console.log("scenario 10: empty --link-profile value → startup error, exit 1");
+
+// process.exit would kill this runner, so the empty-flag check runs in a
+// child process mirroring the mock host above.
+const { spawnSync } = await import("node:child_process");
+const child = spawnSync(
+  process.execPath,
+  [
+    "--input-type=module",
+    "-e",
+    `
+    const { default: createLink } = await import(${JSON.stringify(
+      new URL("../index.ts", import.meta.url).href,
+    )});
+    const handlers = {};
+    const pi = {
+      registerFlag: () => {},
+      getFlag: (n) => ({ link: true, "link-profile": "   " })[n],
+      on: (e, h) => { handlers[e] = h; },
+      appendEntry: () => {}, registerTool: () => {}, registerCommand: () => {},
+      registerMessageRenderer: () => {}, sendMessage: () => {},
+      sendUserMessage: () => {}, getSessionName: () => undefined,
+      setSessionName: () => {},
+    };
+    createLink(pi);
+    const ctx = {
+      cwd: "/tmp/link-test",
+      ui: { notify: () => {}, setStatus: () => {},
+            theme: { fg: (_r, t) => t, bold: (t) => t } },
+      sessionManager: { getEntries: () => [] },
+      isIdle: () => true,
+      getContextUsage: () => ({ tokens: 1, contextWindow: 10 }),
+    };
+    await handlers.session_start({}, ctx);
+    console.error("SHOULD NOT REACH");
+    `,
+  ],
+  { encoding: "utf8", env: { ...process.env } },
+);
+assert(
+  child.status === 1 &&
+    child.stderr.includes("--link-profile requires a non-empty value") &&
+    !child.stderr.includes("SHOULD NOT REACH"),
+  `empty --link-profile exits 1 with an error (status=${child.status})`,
+);
 
 // ── Teardown ────────────────────────────────────────────────────────────────
 

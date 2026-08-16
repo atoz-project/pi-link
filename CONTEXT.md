@@ -87,7 +87,8 @@ A named fleet membership declaration in `~/.pi/agent/pi-link.json` (mode
 0600): the dial target (`url`; omitted = loopback) plus the fleet's shared
 token — one resolved profile answers both "where" and "what ticket"
 (ADR-0007, amending ADR-0002's match-key role). Selected at spawn:
-`PI_LINK_PROFILE` > `default` > none; an unknown name fails closed. The
+`--link-profile` > `PI_LINK_PROFILE` > `default` > none (flag tier added
+by the #19 amendment); an unknown name fails closed. The
 `default` profile is the machine's answer to "where is my fleet?" — on the
 hub's own machine the answer is loopback. No profile means loopback-only,
 unauthenticated, pre-ADR-0002 behavior. Membership is machine-level

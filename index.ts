@@ -259,6 +259,12 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("link-profile", {
+    description:
+      "Select the pi-link profile (fleet membership: dial url + token) on startup; beats PI_LINK_PROFILE and the profiles file default",
+    type: "string",
+  });
+
   // ── State ────────────────────────────────────────────────────────────────
 
   let role: "hub" | "client" | "disconnected" = "disconnected";
@@ -302,11 +308,16 @@ export default function (pi: ExtensionAPI) {
   // missing/mismatched, or the hub sent a version-rejection error before
   // close). Same semantics as authFailed; manual /link-connect resets.
   let versionRejected = false;
-  // ADR-0007: set when the selected profile name (PI_LINK_PROFILE or the
-  // file's default) does not resolve. Fails closed: no dial, no promotion,
-  // no auto-reconnect — falling through to loopback on a typo would be the
-  // 2026-08-17 fleet split with a different spelling. /link-connect resets.
+  // ADR-0007: set when the selected profile name (--link-profile flag,
+  // PI_LINK_PROFILE, or the file's default) does not resolve. Fails closed:
+  // no dial, no promotion, no auto-reconnect — falling through to loopback
+  // on a typo would be the 2026-08-17 fleet split with a different
+  // spelling. /link-connect resets.
   let profileUnresolved = false;
+  // ADR-0007 amendment (#19): the --link-profile flag's selected NAME,
+  // prepending the resolution chain (flag > env > file default > none).
+  // Validated once at session_start; fixed for the terminal's lifetime.
+  let profileFlag: string | null = null;
   // #7 item 1: set when startHub refused a non-loopback bind without a
   // token. Fail once, loudly; without the latch initialize() falls through
   // to scheduleReconnect and re-refuses every 2–5s forever. /link-connect
@@ -473,9 +484,10 @@ export default function (pi: ExtensionAPI) {
   // (user ruling: no env-var token override — env is visible in ps). A
   // profile is a complete fleet membership declaration: where to dial
   // (url; omitted = loopback) and what ticket to carry (token). Selection
-  // chain: PI_LINK_PROFILE > default > none. Env selects a NAME; it never
-  // carries the URL fact (PI_LINK_URL is retired — ambient naked-URL
-  // dialing was the 2026-08-17 fleet split's legal entrance).
+  // chain (#19 amendment): --link-profile flag > PI_LINK_PROFILE > default
+  // > none. Flag and env select a NAME; they never carry the URL fact
+  // (PI_LINK_URL is retired — ambient naked-URL dialing was the
+  // 2026-08-17 fleet split's legal entrance).
   // none (no file / no default) = loopback, no token — byte-identical
   // zero-config behavior.
 
@@ -532,15 +544,17 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Resolve THIS machine's profile: dial target + ticket, both from the one
-  // chosen profile. A selected name (PI_LINK_PROFILE or the file's default)
-  // that does not resolve fails CLOSED — the caller must not dial (a typo
-  // falling through to loopback would self-promote and split the fleet).
-  // No selection = implicit local profile (loopback, no token). Never throws.
+  // chosen profile. A selected name (--link-profile, PI_LINK_PROFILE, or the
+  // file's default) that does not resolve fails CLOSED — the caller must not
+  // dial (a typo falling through to loopback would self-promote and split
+  // the fleet). No selection = implicit local profile (loopback, no token).
+  // Never throws.
   function resolveClientConfig():
     | { url: string; token: string | null }
     | { unresolved: string } {
     const profiles = loadProfilesFile();
-    const selected = process.env.PI_LINK_PROFILE || profiles?.default;
+    const selected =
+      profileFlag || process.env.PI_LINK_PROFILE || profiles?.default;
     if (!selected) return { url: `ws://127.0.0.1:${LINK_PORT}`, token: null };
     const chosen = profiles?.profiles?.[selected];
     if (!chosen) return { unresolved: selected };
@@ -1990,7 +2004,7 @@ export default function (pi: ExtensionAPI) {
       if ("unresolved" in cfg) {
         profileUnresolved = true;
         notify(
-          `Link profile "${cfg.unresolved}" does not resolve in ${PROFILES_FILE_PATH} — refusing to dial (no loopback fallback on a typo). Fix PI_LINK_PROFILE or the profiles file, then /link-connect.`,
+          `Link profile "${cfg.unresolved}" does not resolve in ${PROFILES_FILE_PATH} — refusing to dial (no loopback fallback on a typo). Fix --link-profile, PI_LINK_PROFILE, or the profiles file, then /link-connect.`,
           "error",
         );
         resolve(false);
@@ -2387,6 +2401,24 @@ export default function (pi: ExtensionAPI) {
         | { budget?: unknown }
         | undefined;
       declaredBudget = parseBudget(savedBudget?.budget) ?? null;
+    }
+
+    // Resolve the profile flag (ADR-0007 amendment, #19). The flag
+    // prepends the selection chain (flag > env > file default > none) and
+    // closes the ambient-env inheritance hole for explicit launch
+    // commands: PI_LINK_PROFILE leaks through tmux spawn chains, a flag
+    // does not. A NAME only, never a URL/token fact. Empty after trim =
+    // startup error, mirroring --link-name. No session entry — membership
+    // stays machine-level environment (ADR-0007 §6); the flag is
+    // per-process explicitness, not persistence.
+    const profileFlagRaw = pi.getFlag("link-profile");
+    if (typeof profileFlagRaw === "string") {
+      const trimmed = profileFlagRaw.trim();
+      if (!trimmed) {
+        console.error("Error: --link-profile requires a non-empty value.");
+        process.exit(1);
+      }
+      profileFlag = trimmed;
     }
 
     if (flagName || shouldConnect()) scheduleStartupConnect();

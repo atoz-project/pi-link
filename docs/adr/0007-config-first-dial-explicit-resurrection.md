@@ -74,6 +74,22 @@ Decision:
    query modes (`--list`, `--resolve`); the `PI_LINK_NAME` internal handoff
    dies with the launcher.
 
+Amendment (2026-08-17, #19): **`--link-profile <name>` flag added.**
+Decision 2's chain was the only knob with an env tier but no flag tier — a
+historical accident from ADR-0002 (when env carried the URL, the profile
+only picked the ticket), never re-examined when the profile was promoted
+to the full membership declaration. It also left a residual ambient hole:
+`PI_LINK_PROFILE` inherits through tmux spawn chains and can silently
+redirect a terminal to a *valid but unintended* profile (fail-closed only
+catches unresolvable names). The fleet launch doctrine is "explicit flags,
+no ambient defaults"; membership deserves the same tier. The chain becomes
+`--link-profile` > `PI_LINK_PROFILE` > `default` > none; the same
+principle holds — a flag selects a *name*, facts stay in config. Decision
+3's fail-closed latch covers the new first tier unchanged; an empty flag
+value is a startup error (exit 1, mirroring `--link-name`). Decision 6 is
+unchanged: no session entry — the flag is per-process explicitness, not
+persistence.
+
 Considered and rejected:
 
 - **Keeping `PI_LINK_URL` as top-priority override** (issue #15's original
