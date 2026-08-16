@@ -2591,8 +2591,12 @@ export default function (pi: ExtensionAPI) {
       // reminder (sender-side only) + per-dispatch mismatch notice.
       // Broadcast ("*") gets no readout; missing cache / unknown tokens omit.
       const readout = contextReadout(params.to);
-      const reminder = budgetReminder(params.to, params.budget);
-      const mismatch = budgetMismatchNotice(params.to, params.budget);
+      // Sanitize the per-dispatch override — invalid values (negative,
+      // fractional, NaN) are ignored rather than fed into the comparison.
+      const sendOverride =
+        params.budget !== undefined ? parseBudget(params.budget) : undefined;
+      const reminder = budgetReminder(params.to, sendOverride);
+      const mismatch = budgetMismatchNotice(params.to, sendOverride);
       // ADR-0003: idle-target warning on a successful direct send with
       // triggerTurn:false. A passive send to an idle receiver is stored but
       // not processed (steer lands in the session without waking the LLM);
@@ -3030,6 +3034,10 @@ export default function (pi: ExtensionAPI) {
       if (miss) return miss;
 
       const requestId = crypto.randomUUID();
+      // Sanitize the per-dispatch override — invalid values (negative,
+      // fractional, NaN) are ignored rather than fed into the comparison.
+      const promptOverride =
+        params.budget !== undefined ? parseBudget(params.budget) : undefined;
 
       return new Promise<ReturnType<typeof textResult>>((resolve) => {
         const inactivityTimeout = makeInactivityTimeout(requestId, params.to);
@@ -3055,12 +3063,12 @@ export default function (pi: ExtensionAPI) {
           // values) lead the result; the override also governs the response
           // readout's verdict.
           preDispatchNote: [
-            budgetReminder(params.to, params.budget),
-            budgetMismatchNotice(params.to, params.budget),
+            budgetReminder(params.to, promptOverride),
+            budgetMismatchNotice(params.to, promptOverride),
           ]
             .filter(Boolean)
             .join(" · "),
-          budgetOverride: params.budget,
+          budgetOverride: promptOverride,
         });
 
         // Abort handling
