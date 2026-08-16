@@ -83,11 +83,26 @@ The hub's 1→(N−1) re-broadcast of a status channel message. Hub serializes
 once and writes each client socket; cost scales with event rate × N.
 
 **Profile**:
-A named fleet connection config in `~/.pi/agent/pi-link.json` (mode 0600):
-hub URL + the fleet's shared token. A terminal selects one at spawn
-(`PI_LINK_PROFILE` > URL match > `default`); no profile means loopback-only,
-unauthenticated, pre-ADR-0002 behavior.
-_Avoid_: account, credential
+A named fleet membership declaration in `~/.pi/agent/pi-link.json` (mode
+0600): the dial target (`url`; omitted = loopback) plus the fleet's shared
+token — one resolved profile answers both "where" and "what ticket"
+(ADR-0007, amending ADR-0002's match-key role). Selected at spawn:
+`PI_LINK_PROFILE` > `default` > none; an unknown name fails closed. The
+`default` profile is the machine's answer to "where is my fleet?" — on the
+hub's own machine the answer is loopback. No profile means loopback-only,
+unauthenticated, pre-ADR-0002 behavior. Membership is machine-level
+environment, never a session entry (contrast link-name/workspace/budget).
+_Avoid_: account, credential, URL env (retired)
+
+**Resurrection**:
+Bringing a retired or dead terminal back by resuming its session file —
+explicitly, by id: look up with `pi-link --list -g` / `--resolve <name>`,
+then `pi --link --session <id>`. Never implicit by name: the launcher's
+name→session execution mode is retired because resuming into an unexpected
+live context (or silently creating a blank one on a typo) executes where
+nobody decided to (ADR-0007). Identity rides the session (name, workspace,
+budget); environment rides the machine's profile.
+_Avoid_: resume-by-name, launcher
 
 **Trust domain**:
 One link/fleet. Membership confers full power over every member (a prompt
