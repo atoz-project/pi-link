@@ -73,9 +73,10 @@ _Avoid_: capability negotiation, feature flags
 
 **Fresh session (link_new)**:
 The remote lifecycle op that replaces a terminal's session in place:
-ack-before-teardown carrying `oldSessionId`, identity (name + workspace)
-pre-written into the new session, completion observed as terminal_left →
-terminal_joined (ADR-0006).
+ack-before-teardown carrying `oldSessionId`, identity (name + home
+workspace + global grant) pre-written into the new session, completion
+observed as terminal_left → terminal_joined (ADR-0006, extended by
+ADR-0008).
 _Avoid_: reset, clear, wipe (history stays resumable on disk)
 
 **Fan-out**:
@@ -106,28 +107,53 @@ budget); environment rides the machine's profile.
 _Avoid_: resume-by-name, launcher
 
 **Trust domain**:
-One link/fleet. Membership confers full power over every member (a prompt
-executes a full agent turn with tools). Exactly one shared token per domain;
-no finer-grained authorization exists by design (ADR-0002). Workspaces do
-not subdivide it — they are visibility, not authorization.
+One link/fleet. Membership confers full power over every member it can
+reach (a prompt executes a full agent turn with tools). Exactly one shared
+token per domain; no finer-grained authorization exists by design
+(ADR-0002). The reach matrix (ADR-0008) shapes blast radius inside the
+domain — mistake-proofing, not authorization: any terminal may re-enter
+with a global grant; the token remains the only lock.
 _Avoid_: tenant, scope
 
-**Workspace**:
-An optional visibility group a terminal declares at startup
-(`--link-workspace` > `PI_LINK_WORKSPACE` > persisted session entry > none);
-fixed for the terminal's lifetime, never derived from cwd. One hub serves
-all workspaces; names stay globally unique (ADR-0004).
+**Home workspace**:
+The workspace a terminal lives in — its name's uniqueness scope and the
+first half of its address. Every terminal has exactly one: `--link-workspace`
+> `PI_LINK_WORKSPACE` > persisted session entry > `default`. Fixed for the
+terminal's lifetime, never derived from cwd; undeclared means the `default`
+workspace, not privilege (ADR-0008, superseding ADR-0004's optional
+workspace / global-observer-by-omission).
 _Avoid_: tenant, room, channel, project (the flag is per-terminal, not per-repo)
 
-**Global observer**:
-A terminal with no workspace. Its visible set is every terminal and it is in
-every terminal's visible set — pre-workspace behavior, and how fleet-level
-coordinators work with zero configuration (ADR-0004).
-_Avoid_: admin, superuser (it has no extra authority, only full visibility)
+**Global grant**:
+The explicit second axis (`--link-global` > `PI_LINK_GLOBAL` > persisted
+session entry > false): see everyone, reach everyone, be reachable by
+everyone. Self-declared within the trust domain — a badge on status
+surfaces, not an authorization tier (ADR-0008).
+_Avoid_: admin, superuser, global observer (the by-omission form is retired)
+
+**Address**:
+`workspace/name` — the wire-level identity of a terminal; every protocol
+`from`/`to` is fully qualified. A bare name in a tool call resolves in the
+sender's own workspace only (no scope chain); cross-workspace addressing is
+always spelled qualified. `workspace/*` broadcasts to one group (globals
+only, for foreign groups). `/` and `*` are reserved characters in names and
+workspaces. Display shortens same-workspace addresses (ADR-0008).
+_Avoid_: path, FQDN
+
+**Takeover**:
+Register carries the pi `sessionId` as identity anchor. A joiner claiming a
+live `(workspace, name)` with the same sessionId silently replaces the old
+socket (netsplit heal, resurrection); with a different sessionId it is
+loudly refused (`nameTaken` latch, authFailed family — no reconnect storm,
+`/link-connect` retries). The hub never renames; `uniqueName` suffixes are
+retired. Concurrent clones self-name at the source (ADR-0008).
+_Avoid_: eviction, kick, rename
 
 **Visible set**:
-The universe one terminal can see and address: for a scoped terminal,
-same-workspace members ∪ global observers; for a global observer, everyone.
-Cuts every surface — welcome snapshot, joined/left, `link_list`, broadcast,
-status fan-out, direct addressing (cross-group = `not_found`) (ADR-0004).
+The universe one terminal can see and address — visibility and reachability
+are the same function: own workspace ∪ global members for a regular;
+everyone for a global member. Cuts every surface — welcome snapshot,
+joined/left, `link_list`, broadcast, status fan-out, direct addressing.
+Cross-workspace sends between regulars are refused with an existence-hiding
+error (ADR-0004 surfaces, ADR-0008 matrix).
 _Avoid_: filter, view
