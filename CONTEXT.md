@@ -29,17 +29,52 @@ should consume the peer context cache: pre-send (tool result), delivery
 
 **Headroom**:
 Absolute remaining context of a terminal: `contextWindow − tokens`, computed
-from a context snapshot. The primary capacity metric — percent is display
-gloss only, because equal percentages mean very different absolute room on
-different window sizes (and Pi's own auto-compaction triggers on an absolute
-reserve, default 16K).
+from a context snapshot. Percent is display gloss only, because equal
+percentages mean very different absolute room on different window sizes (and
+Pi's own auto-compaction triggers on an absolute reserve, default 16K). The
+default context budget is derived from it: `contextWindow − 100K`.
 _Avoid_: free space, remaining percent
 
-**Hot terminal**:
-A terminal whose last-known headroom is below the hot threshold (default
-100K tokens) — a typical work order will not fit comfortably; compact before
-dispatching heavy work.
-_Avoid_: overloaded, full, high percentage
+**Context budget**:
+The one compaction-decision axis: an absolute used-tokens ceiling,
+`tokens ≥ budget` = over budget. Every terminal has one — declared
+(`--link-budget` > `PI_LINK_BUDGET` > persisted entry) or defaulted to
+`contextWindow − 100K` (subsuming ADR-0001's retired "hot terminal").
+Runtime-mutable on any visible terminal via the `link_budget` tool
+(hub-routed set + persist + ack); an optional per-dispatch `budget` on
+send/prompt overrides it for one exchange, with a mismatch notice when the
+two disagree. Reminder-only — blunt verdict text, no auto-compact, no
+dispatch block (ADR-0005).
+_Avoid_: quota, limit (nothing is enforced), percent, hot (retired)
+
+**Idle-since**:
+Hub-tracked timestamp per terminal: set on register-as-idle and busy→idle
+transitions, cleared while busy; carried in welcome/status fan-out, shown in
+`link_list` as idle duration. The retirement mechanism's data source —
+hub-authoritative, so it survives cross-machine links (unlike the retired
+fleet-probe's session-file scan) (ADR-0005).
+_Avoid_: last activity (that was fleet-probe's file-mtime notion)
+
+**Model label**:
+Telemetry: the raw `provider/model-id:thinkingLevel` string in register and
+status_update, re-pushed on mid-session model change. Display may shorten;
+fleet tags (k3, glm52) are a link-name convention, not protocol (ADR-0005).
+_Avoid_: model tag (that's the naming convention)
+
+**Protocol version gate**:
+`LINK_PROTOCOL_VERSION` rides register and is echoed in welcome; missing or
+mismatched on either side → refuse membership loudly and stop auto-reconnect.
+The single compatibility mechanism for the wire — within a versioned link
+every field is guaranteed present (ADR-0005, amending ADR-0004's per-field
+echo rationale).
+_Avoid_: capability negotiation, feature flags
+
+**Fresh session (link_new)**:
+The remote lifecycle op that replaces a terminal's session in place:
+ack-before-teardown carrying `oldSessionId`, identity (name + workspace)
+pre-written into the new session, completion observed as terminal_left →
+terminal_joined (ADR-0006).
+_Avoid_: reset, clear, wipe (history stays resumable on disk)
 
 **Fan-out**:
 The hub's 1→(N−1) re-broadcast of a status channel message. Hub serializes
