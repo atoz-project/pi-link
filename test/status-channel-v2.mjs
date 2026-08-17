@@ -16,8 +16,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import { setTimeout as delay } from "node:timers/promises";
 
 // #15 item 8: profiles-file path knob (before import). Scenario 2 redirects
-// a client to the pre-gate hub via a profile + PI_LINK_PROFILE (PI_LINK_URL
-// is retired). No `default` key, so every other terminal resolves loopback.
+// a client to the pre-gate hub via a profile carried in the PI_LINK_NAME
+// membership string (ADR-0009; PI_LINK_URL is retired). No `default` key, so every other terminal resolves loopback.
 const PROFILES_FILE = join(
   mkdtempSync(join(tmpdir(), "pi-link-v2-test-")),
   "pi-link.json",
@@ -246,7 +246,7 @@ writeFileSync(
   PROFILES_FILE,
   JSON.stringify({ profiles: { gatehub: { url: `ws://127.0.0.1:${GATE_PORT}` } } }),
 );
-process.env.PI_LINK_PROFILE = "gatehub";
+process.env.PI_LINK_NAME = "gatehub:gated";
 const gated = await startTerminal({ link: true, "link-name": "gated" });
 await waitFor(() => gateRegisters === 1, "register on pre-gate hub");
 await waitFor(
@@ -265,7 +265,7 @@ assert(
 await gated.commands["link-connect"].handler("", gated.ctx);
 await waitFor(() => gateRegisters === 2, "manual retry after refusal");
 assert(true, "/link-connect retries after version refusal");
-delete process.env.PI_LINK_PROFILE;
+delete process.env.PI_LINK_NAME;
 await gated.handlers.session_shutdown();
 gateHub.close();
 
@@ -275,7 +275,7 @@ console.log("scenario 3: status channel v2 surfaces");
 
 // Scoped worker (alpha) running the real extension.
 const worker = await startTerminal(
-  { link: true, "link-name": "w", "link-workspace": "alpha" },
+  { link: true, "link-name": "alpha/w" },
   {
     model: { provider: "openai", id: "gpt-5" },
     thinkingLevel: "high",

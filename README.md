@@ -166,7 +166,7 @@ Link is **off by default**. Without `--link` or `--link-name`, the extension is 
 
 **Name normalization:** Link names are normalized — leading/trailing whitespace removed and internal whitespace runs collapsed to a single space. `/link-name "build   lead"` saves and shows as `build lead`.
 
-**Name precedence:** `pi --link-name` > saved `/link-name` > Pi session name > random `t-xxxx`.
+**Membership selector (ADR-0009):** `--link-name` / `PI_LINK_NAME` accept the compact form `[profile:][workspace/]name` — a `:` splits the profile from the address, and the address is `workspace/name` or a bare `name` (ADR-0008). All four forms are valid: `fleet-public:pl/s-k3-a`, `pl/s-k3-a`, `fleet-public:s-k3-a`, `s-k3-a`. Each omitted segment falls through its own chain independently (per segment: flag > env): profile → profiles-file `default` → fail-closed; workspace → saved session entry → `default`; name → saved `/link-name` > Pi session name > random `t-xxxx`. Malformed strings (empty segments, more than one `:` or `/`, reserved characters) are a startup error with exit 1. `PI_LINK_NAME` is consumed once at startup so spawned children don't inherit membership.
 
 `/link-connect` and `/link-disconnect` save their intent to the session — resume later and the connection state is restored without needing the flag. Explicit user intent takes precedence over `--link`.
 
@@ -231,7 +231,7 @@ By default the hub binds `127.0.0.1:9900` (loopback, unauthenticated). To span m
 | --- | --- | --- |
 | `PI_LINK_HOST` | hub bind host | `127.0.0.1` |
 | `PI_LINK_PORT` | hub bind port + default loopback dial port (test/fleet isolation) | `9900` |
-| `PI_LINK_PROFILE` | explicit profile selection (a profile *name*, never a URL) | unset |
+| `PI_LINK_NAME` | membership selector env tier (`[profile:][workspace/]name`; consumed once) | unset |
 | `PI_LINK_PROFILES_FILE` | profiles file *path* (test isolation) | `~/.pi/agent/pi-link.json` |
 
 **Profiles file** `~/.pi/agent/pi-link.json` (mode `0600`) — the **only** token source (env vars are visible in `ps`; user ruling). Shape:
@@ -245,9 +245,9 @@ By default the hub binds `127.0.0.1:9900` (loopback, unauthenticated). To span m
 }
 ```
 
-**The profile is the dial target (ADR-0007).** A profile is a complete fleet membership declaration: *where to dial* (`url`; omitted = `ws://127.0.0.1:$PI_LINK_PORT`) and *what ticket to carry* (`token`). One resolved profile answers both. Selection: `--link-profile` flag > `PI_LINK_PROFILE` > `default` > none. Flag and env select a profile *name*; they never carry a URL (`PI_LINK_URL` is retired — ambient naked-URL dialing is how fleets silently split). The flag tier exists because `PI_LINK_PROFILE` inherits through tmux spawn chains and can silently redirect a terminal to a valid but unintended profile — explicit launch commands should say the name out loud. `none` (no profiles file / no `default`) is loopback, unauthenticated — byte-identical zero-config behavior, opt-in, upstream-friendly.
+**The profile is the dial target (ADR-0007).** A profile is a complete fleet membership declaration: *where to dial* (`url`; omitted = `ws://127.0.0.1:$PI_LINK_PORT`) and *what ticket to carry* (`token`). One resolved profile answers both. Selection (ADR-0009): the profile segment of the membership string (`--link-name` flag > `PI_LINK_NAME` env) > `default` > none. The selector carries a profile *name*; it never carries a URL (`PI_LINK_URL` is retired — ambient naked-URL dialing is how fleets silently split). The explicit segment exists because an ambient env inherits through tmux spawn chains and can silently redirect a terminal to a valid but unintended profile — explicit launch commands should say the name out loud. `none` (no profiles file / no `default`) is loopback, unauthenticated — byte-identical zero-config behavior, opt-in, upstream-friendly.
 
-**Unknown profile fails closed.** A selected name that does not resolve (a `--link-profile`/`PI_LINK_PROFILE` typo, a dangling `default`) is a loud refusal: no dial, no promotion, no auto-reconnect. Fix the config, then `/link-connect` (same latch family as auth/identity/version rejection).
+**Unknown profile fails closed.** A selected name that does not resolve (a typo'd profile segment, a dangling `default`) is a loud refusal: no dial, no promotion, no auto-reconnect. Fix the config, then `/link-connect` (same latch family as auth/identity/version rejection).
 
 **Hub machine setup.** `default` answers "where is my fleet?" — on the machine that hosts the hub, the answer is *here*: point `default` at a loopback profile carrying the fleet token (`url` omitted). Its terminals dial loopback; the first one promotes and binds per `PI_LINK_HOST` (bind stays env — a deployment fact of one process, not a membership fact of the machine). Member machines point their `default` at the public URL. A hub machine whose `default` dialed its own public address could never self-bootstrap after an outage — non-loopback never promotes.
 
@@ -275,10 +275,10 @@ With cloudflared: publish the local `9900` port through a named tunnel and point
 
 Every terminal has two independent identity axes, both fixed at startup, both riding the session file (and pre-written by `link_new`):
 
-- **Home workspace** — where the terminal lives: its name's uniqueness scope and the first half of its address. `pi --link-workspace <name>` > `PI_LINK_WORKSPACE` env (consumed once) > saved `link-workspace` session entry > **`default`**. Undeclared no longer means privileged — it means the `default` workspace, where zero-config loopback pairs still find each other. Never derived from the cwd.
+- **Home workspace** — where the terminal lives: its name's uniqueness scope and the first half of its address. The workspace segment of the membership string (`--link-name` flag > `PI_LINK_NAME` env, consumed once) > saved `link-workspace` session entry > **`default`**. Undeclared no longer means privileged — it means the `default` workspace, where zero-config loopback pairs still find each other. Never derived from the cwd.
 - **Global grant** — how far the terminal sees and reaches: `pi --link-global` > `PI_LINK_GLOBAL=1` env (consumed once) > saved `link-global` session entry > false. Self-declared within the trust domain — the token remains the only security boundary (ADR-0002); the grant is mistake-proofing and noise control, not an authorization tier.
 
-**Address = `workspace/name`.** Names are unique per workspace, and on the wire every `from`/`to` is fully qualified — no ambiguity, ever. In tool calls a bare name resolves in *your own* workspace only (no scope chain); cross-workspace targets are always spelled qualified — five extra characters beat one ambiguity. `/` and `*` are reserved characters, rejected loudly at declaration (startup error, exit 1) and at register.
+**Address = `workspace/name`.** Names are unique per workspace, and on the wire every `from`/`to` is fully qualified — no ambiguity, ever. In tool calls a bare name resolves in *your own* workspace only (no scope chain); cross-workspace targets are always spelled qualified — five extra characters beat one ambiguity. `/`, `*` and `:` are reserved characters, rejected loudly at declaration (startup error, exit 1) and at register.
 
 **The reach matrix** (visibility = reachability, one rule): same workspace ✓; anyone → a global member ✓; a global member → anyone ✓; regular cross-workspace ✗ — refused with an existence-hiding `not_found` (identical text whether the target exists or not; confirming existence across the wall would leak membership). The matrix cuts every surface: `link_list` (grouped by workspace, global members badged `(global)`, same-workspace addresses shortened), the welcome snapshot, `terminal_joined`/`terminal_left`, broadcasts, status fan-out, and direct addressing.
 

@@ -19,8 +19,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import { setTimeout as delay } from "node:timers/promises";
 
 // #15 item 8: profiles-file path knob (before import). Scenario 4 redirects
-// a client to the non-conforming hub via a profile + PI_LINK_PROFILE
-// (PI_LINK_URL is retired). No `default` key, so every other terminal
+// a client to the non-conforming hub via a profile carried in the
+// PI_LINK_NAME membership string (ADR-0009; PI_LINK_URL is retired). No `default` key, so every other terminal
 // resolves loopback.
 const PROFILES_FILE = join(
   mkdtempSync(join(tmpdir(), "pi-link-ws-test-")),
@@ -52,13 +52,14 @@ function makeHost(flags, opts = {}) {
   const tools = {};
   const notifications = [];
   const sentMessages = [];
+  const appended = [];
   const pi = {
     registerFlag: () => {},
     getFlag: (name) => flags[name],
     on: (event, handler) => {
       handlers[event] = handler;
     },
-    appendEntry: () => {},
+    appendEntry: (customType, data) => appended.push({ customType, data }),
     registerTool: (def) => {
       tools[def.name] = def;
     },
@@ -79,13 +80,13 @@ function makeHost(flags, opts = {}) {
       theme: { fg: (_role, text) => text, bold: (text) => text },
     },
     sessionManager: {
-      getEntries: () => [],
+      getEntries: () => opts.entries ?? [],
       getSessionId: () => opts.sessionId ?? `sess-host-${++hostSeq}`,
     },
     isIdle: () => true,
     getContextUsage: () => ({ tokens: 100, contextWindow: 1000 }),
   };
-  return { pi, ctx, handlers, commands, tools, notifications, sentMessages };
+  return { pi, ctx, handlers, commands, tools, notifications, sentMessages, appended };
 }
 
 async function startTerminal(flags, opts) {
@@ -447,8 +448,10 @@ assert(
   "v3 register missing sessionId rejected loudly",
 );
 
-// Reserved characters rejected at declaration (startup, exit 1) — flag and
-// env tiers. process.exit would kill this runner, so these run in children.
+// ADR-0009: malformed membership selectors fail closed at startup (exit 1)
+// — empty segments, more than one ":", more than one "/" in the address,
+// reserved characters in name/workspace; flag and env tiers alike.
+// process.exit would kill this runner, so these run in children.
 const { spawnSync } = await import("node:child_process");
 function childStart(flags, env = {}) {
   return spawnSync(
@@ -481,41 +484,81 @@ function childStart(flags, env = {}) {
         getContextUsage: () => ({ tokens: 1, contextWindow: 10 }),
       };
       await handlers.session_start({}, ctx);
-      console.error("SHOULD NOT REACH");
+      console.error("PARSE-OK");
+      process.exit(0);
       `,
     ],
     { encoding: "utf8", env: { ...process.env, ...env } },
   );
 }
-{
-  const r = childStart({ link: true, "link-name": "a/b" });
+const malformedSelectors = [
+  [{ link: true, "link-name": "a*b" }, {}, 'name segment reserved "*"'],
+  [{ link: true, "link-name": "alpha/a*b" }, {}, 'name segment reserved "*" (qualified)'],
+  [{ link: true, "link-name": "fleet-public:" }, {}, "empty address segment"],
+  [{ link: true, "link-name": ":pl/x" }, {}, "empty profile segment"],
+  [{ link: true, "link-name": "a:b:c" }, {}, 'more than one ":"'],
+  [{ link: true, "link-name": "ws/" }, {}, "empty name segment"],
+  [{ link: true, "link-name": "/x" }, {}, "empty workspace segment"],
+  [{ link: true, "link-name": "a/b/c" }, {}, 'more than one "/" in the address'],
+  [{ link: true }, { PI_LINK_NAME: "a*b/c" }, 'env: workspace segment reserved "*"'],
+];
+for (const [flags, env, label] of malformedSelectors) {
+  const r = childStart(flags, env);
   assert(
-    r.status === 1 && r.stderr.includes('must not contain "/" or "*"') &&
-      !r.stderr.includes("SHOULD NOT REACH"),
-    "--link-name with a reserved character exits 1",
+    r.status === 1 && r.stderr.includes("Error:") &&
+      !r.stderr.includes("PARSE-OK"),
+    `malformed selector exits 1 — ${label} (${r.stderr.trim().split("\n")[0]})`,
   );
 }
-{
-  const r = childStart({ link: true, "link-workspace": "a*b" });
+// All four valid forms parse. The child exits right after session_start
+// (before the connect timer fires), so PARSE-OK + status 0 proves the parse.
+for (const s of [
+  "fleet-public:pl/s-k3-a",
+  "pl/s-k3-a",
+  "fleet-public:s-k3-a",
+  "s-k3-a",
+]) {
+  const r = childStart({ link: true, "link-name": s });
   assert(
-    r.status === 1 && r.stderr.includes('must not contain "/" or "*"') &&
-      !r.stderr.includes("SHOULD NOT REACH"),
-    "--link-workspace with a reserved character exits 1",
+    r.status === 0 && r.stderr.includes("PARSE-OK"),
+    `valid selector form "${s}" parses`,
   );
 }
+
+// Segment-level fallback: the string's workspace segment beats the saved
+// session entry (re-persisted); an omitted segment falls through to the
+// entry untouched. session_shutdown disposes before the connect timer fires.
 {
-  const r = childStart({ link: true }, { PI_LINK_WORKSPACE: "a/b" });
+  const saved = [
+    { type: "custom", customType: "link-workspace", data: { workspace: "saved-ws" } },
+    { type: "custom", customType: "link-name", data: { name: "saved-name" } },
+  ];
+  const explicit = await startTerminal(
+    { link: true, "link-name": "alpha/t" },
+    { entries: saved },
+  );
+  await explicit.handlers.session_shutdown();
   assert(
-    r.status === 1 && r.stderr.includes("PI_LINK_WORKSPACE") &&
-      !r.stderr.includes("SHOULD NOT REACH"),
-    "PI_LINK_WORKSPACE with a reserved character exits 1",
+    explicit.appended.some(
+      (e) => e.customType === "link-workspace" && e.data.workspace === "alpha",
+    ),
+    "string workspace segment beats the saved entry (re-persisted)",
+  );
+  const falling = await startTerminal(
+    { link: true, "link-name": "t2" },
+    { entries: saved },
+  );
+  await falling.handlers.session_shutdown();
+  assert(
+    !falling.appended.some((e) => e.customType === "link-workspace"),
+    "omitted workspace segment falls through to the saved entry (no re-append)",
   );
 }
 
 // nameTaken latch: a real extension client colliding with a live holder is
 // refused loudly, does not reconnect-storm, and /link-connect retries.
 const dup = await startTerminal(
-  { link: true, "link-name": "t", "link-workspace": "alpha" },
+  { link: true, "link-name": "alpha/t" },
   { sessionId: "sess-dup" },
 );
 await waitFor(
@@ -562,11 +605,10 @@ writeFileSync(
   PROFILES_FILE,
   JSON.stringify({ profiles: { oldhub: { url: `ws://127.0.0.1:${OLD_PORT}` } } }),
 );
-process.env.PI_LINK_PROFILE = "oldhub";
+process.env.PI_LINK_NAME = "oldhub:scoped";
 const scoped = await startTerminal({
   link: true,
-  "link-name": "scoped",
-  "link-workspace": "alpha",
+  "link-name": "alpha/scoped",
 });
 await waitFor(() => oldHubRegisters === 1, "register on old hub");
 await waitFor(
@@ -619,7 +661,7 @@ writeFileSync(
 );
 const grantful = await startTerminal({
   link: true,
-  "link-name": "grantful",
+  "link-name": "oldhub:grantful", // flag profile segment (env was consumed by scoped)
   "link-global": true,
 });
 await waitFor(() => grantRegisters === 1, "register on grant-mismatch hub");
@@ -632,7 +674,7 @@ await waitFor(
 );
 assert(true, "mismatched grant echo → loud refusal (both axes checked)");
 await grantful.handlers.session_shutdown();
-delete process.env.PI_LINK_PROFILE;
+delete process.env.PI_LINK_NAME;
 oldHub.close();
 grantHub.close();
 
@@ -649,8 +691,7 @@ await delay(200);
 
 const survivor = await startTerminal({
   link: true,
-  "link-name": "s",
-  "link-workspace": "alpha",
+  "link-name": "alpha/s",
 });
 await waitFor(
   () => survivor.notifications.find((n) => n.message.includes("Joined link")),

@@ -1,13 +1,14 @@
 // ADR-0007 config-first dial resolution — integration test.
 // Real extension instances (mocked Pi hosts) + fake recording hubs cover the
 // issue #15 acceptance checklist: default profile dials its url+token,
-// PI_LINK_PROFILE selection, unknown-profile fail-closed (no dial / no
+// membership-string profile selection (ADR-0009: the profile segment of
+// --link-name / PI_LINK_NAME), unknown-profile fail-closed (no dial / no
 // promotion / no reconnect; /link-connect retries), url-omitted loopback
 // profile with token (hub-machine doctrine), PI_LINK_URL ignored, remote
 // fleet member never self-promotes, and the #7 hubConfigFailed latch.
-// #19 extends it: --link-profile beats env/default, an unresolvable flag
-// name fails closed (+ /link-connect retry), the hub-bind token honors the
-// flag, and an empty flag value exits 1.
+// ADR-0009 (#25): the string's profile segment beats env segment and file
+// default, an unresolvable segment fails closed (+ /link-connect retry),
+// the hub-bind token honors the segment, and an empty --link-name exits 1.
 //
 // Run: node test/config-first-dial.mjs
 
@@ -160,12 +161,14 @@ function dialFails(port) {
   });
 }
 
-// ── Scenario 1: unknown PI_LINK_PROFILE fails closed ────────────────────────
+// ── Scenario 1: unknown env-string profile fails closed ──────────────
 
-console.log("scenario 1: unknown PI_LINK_PROFILE → fail closed; /link-connect retries");
+console.log("scenario 1: unknown PI_LINK_NAME profile segment → fail closed; /link-connect retries");
 
-// No profiles file exists yet, so the selected name cannot resolve.
-process.env.PI_LINK_PROFILE = "fleet";
+// No profiles file exists yet, so the selected name cannot resolve. The
+// flag carries only a name — the profile segment falls through to the env
+// string (segment-level fallback).
+process.env.PI_LINK_NAME = "fleet:t1";
 const t1 = await startTerminal({ link: true, "link-name": "t1" });
 await waitFor(
   () =>
@@ -204,7 +207,7 @@ await t1.commands["link-connect"].handler("", t1.ctx);
 await waitFor(() => f1.registers.length === 1, "register on the profile url");
 assert(
   f1.registers[0].token === "tok-fleet",
-  "PI_LINK_PROFILE dials the profile's url with its token",
+  "env-string profile segment dials the profile's url with its token",
 );
 await waitFor(
   () => t1.notifications.find((n) => n.message.includes("Joined link")),
@@ -217,10 +220,10 @@ assert(
       n.message.includes("Joined link") &&
       n.message.includes("via fleet → ws://127.0.0.1:19913"),
   ),
-  "#18: join banner names the env-selected profile + dialed url",
+  "#18: join banner names the env-string-selected profile + dialed url",
 );
 await t1.handlers.session_shutdown();
-delete process.env.PI_LINK_PROFILE;
+delete process.env.PI_LINK_NAME;
 
 // ── Scenario 2: default profile is the dial target ──────────────────────────
 
@@ -388,9 +391,9 @@ assert(true, "/link-connect retries after hubConfigFailed");
 delete process.env.PI_LINK_HOST;
 await t6.handlers.session_shutdown();
 
-// ── Scenario 7: --link-profile beats env and default (#19) ─────────────────
+// ── Scenario 7: flag-string profile segment beats env and default (#25) ─
 
-console.log("scenario 7: --link-profile beats PI_LINK_PROFILE and default");
+console.log("scenario 7: --link-name profile segment beats PI_LINK_NAME and default");
 
 writeFileSync(
   PROFILES_FILE,
@@ -404,29 +407,28 @@ writeFileSync(
 );
 const f7a = fakeHub(19915);
 const f7b = fakeHub(19916);
-process.env.PI_LINK_PROFILE = "envp";
+process.env.PI_LINK_NAME = "envp:t7";
 const t7 = await startTerminal({
   link: true,
-  "link-name": "t7",
-  "link-profile": "flagp",
+  "link-name": "flagp:t7",
 });
 await waitFor(() => f7b.registers.length === 1, "register on the flag url");
 assert(
   f7b.registers[0].token === "tok-flag",
-  "--link-profile dials its url with its token",
+  "flag-string profile segment dials its url with its token",
 );
 assert(
   f7a.registers.length === 0,
   "env- and default-selected profile never dialed",
 );
-delete process.env.PI_LINK_PROFILE;
+delete process.env.PI_LINK_NAME;
 await t7.handlers.session_shutdown();
 f7a.server.close();
 f7b.server.close();
 
-// ── Scenario 8: unresolvable --link-profile fails closed (#19) ──────────────
+// ── Scenario 8: unresolvable profile segment fails closed (#19/#25) ────
 
-console.log("scenario 8: unknown --link-profile → fail closed; /link-connect retries");
+console.log("scenario 8: unknown --link-name profile segment → fail closed; /link-connect retries");
 
 writeFileSync(
   PROFILES_FILE,
@@ -434,8 +436,7 @@ writeFileSync(
 );
 const t8 = await startTerminal({
   link: true,
-  "link-name": "t8",
-  "link-profile": "typo",
+  "link-name": "typo:t8",
 });
 await waitFor(
   () =>
@@ -444,7 +445,7 @@ await waitFor(
     ),
   "fail-closed refusal notify",
 );
-assert(true, "unknown flag profile → loud refusal notify");
+assert(true, "unknown profile segment → loud refusal notify");
 await delay(5_500); // > one full backoff cycle
 const refusals8 = t8.notifications.filter((n) =>
   n.message.includes("not resolve"),
@@ -452,7 +453,7 @@ const refusals8 = t8.notifications.filter((n) =>
 assert(refusals8 === 1, `refusal fires once, no reconnect (${refusals8} notifies)`);
 assert(await dialFails(PORT), "no hub promoted on the loopback port");
 
-// Fix the config; /link-connect retries and dials the flag-named profile.
+// Fix the config; /link-connect retries and dials the segment-named profile.
 const f8 = fakeHub(19917);
 writeFileSync(
   PROFILES_FILE,
@@ -464,14 +465,14 @@ await t8.commands["link-connect"].handler("", t8.ctx);
 await waitFor(() => f8.registers.length === 1, "register after config fix");
 assert(
   f8.registers[0].token === "tok-typo",
-  "/link-connect retries after the flag-named profile is fixed",
+  "/link-connect retries after the segment-named profile is fixed",
 );
 await t8.handlers.session_shutdown();
 f8.server.close();
 
-// ── Scenario 9: hub-bind token honors the flag (#19) ────────────────────────
+// ── Scenario 9: hub-bind token honors the profile segment (#19/#25) ────
 
-console.log("scenario 9: flag-selected url-omitted profile → loopback hub requires its token");
+console.log("scenario 9: segment-selected url-omitted profile → loopback hub requires its token");
 
 writeFileSync(
   PROFILES_FILE,
@@ -479,8 +480,7 @@ writeFileSync(
 );
 const t9 = await startTerminal({
   link: true,
-  "link-name": "hubf",
-  "link-profile": "localf",
+  "link-name": "localf:hubf",
 });
 await waitFor(
   () =>
@@ -489,24 +489,24 @@ await waitFor(
         n.message.includes("Link hub started") &&
         n.message.includes("auth: token required"),
     ),
-  "loopback promotion with the flag profile's token",
+  "loopback promotion with the segment-selected profile's token",
 );
-assert(true, "resolveHubToken follows the flag tier");
+assert(true, "resolveHubToken follows the profile segment");
 assert(
   t9.notifications.some(
     (n) =>
       n.message.includes("Link hub started") && n.message.includes("via localf"),
   ),
-  "#18: hub banner names the flag-selected profile",
+  "#18: hub banner names the segment-selected profile",
 );
 const good9 = await rawClient({ name: "g9", token: "flag-secret" });
-assert(good9.welcome.name === "g9", "register with the flag profile token welcomed");
+assert(good9.welcome.name === "g9", "register with the segment profile token welcomed");
 good9.ws.close();
 await t9.handlers.session_shutdown();
 
-// ── Scenario 10: empty --link-profile exits 1 (#19) ─────────────────────────
+// ── Scenario 10: empty --link-name exits 1 (#19 posture, ADR-0009) ─────
 
-console.log("scenario 10: empty --link-profile value → startup error, exit 1");
+console.log("scenario 10: empty --link-name value → startup error, exit 1");
 
 // process.exit would kill this runner, so the empty-flag check runs in a
 // child process mirroring the mock host above.
@@ -523,7 +523,7 @@ const child = spawnSync(
     const handlers = {};
     const pi = {
       registerFlag: () => {},
-      getFlag: (n) => ({ link: true, "link-profile": "   " })[n],
+      getFlag: (n) => ({ link: true, "link-name": "   " })[n],
       on: (e, h) => { handlers[e] = h; },
       appendEntry: () => {}, registerTool: () => {}, registerCommand: () => {},
       registerMessageRenderer: () => {}, sendMessage: () => {},
@@ -547,9 +547,9 @@ const child = spawnSync(
 );
 assert(
   child.status === 1 &&
-    child.stderr.includes("--link-profile requires a non-empty value") &&
+    child.stderr.includes("--link-name requires a non-empty value") &&
     !child.stderr.includes("SHOULD NOT REACH"),
-  `empty --link-profile exits 1 with an error (status=${child.status})`,
+  `empty --link-name exits 1 with an error (status=${child.status})`,
 );
 
 // ── Teardown ────────────────────────────────────────────────────────────────

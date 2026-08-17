@@ -5,8 +5,8 @@
 // clients and asserts cross-group invisibility on the wire.
 //
 // Complements test/workspace-isolation.mjs (mocked Pi host): this one covers
-// the real flag plumbing (--link/--link-name/--link-workspace through the pi
-// binary), real extension loading, and real process lifecycle.
+// the real flag plumbing (--link/--link-name membership selector through
+// the pi binary), real extension loading, and real process lifecycle.
 //
 // Requires: `pi` on PATH, port 9900 free. Run: npm run test:e2e
 
@@ -35,9 +35,9 @@ function startPi(name, workspace, globalGrant) {
     "--no-session",
     "-e", EXTENSION,
     "--link",
-    "--link-name", name,
+    // ADR-0009: workspace rides the membership selector's address segment.
+    "--link-name", workspace ? `${workspace}/${name}` : name,
   ];
-  if (workspace) args.push("--link-workspace", workspace);
   if (globalGrant) args.push("--link-global");
   // Held open on stdin: rpc mode idles until a prompt arrives (none comes).
   // HOME isolation makes the run hermetic: no global pi-link install
@@ -156,7 +156,7 @@ check(
 );
 check(
   !beta.terminals.includes("alpha/e2e-a"),
-  "beta does NOT see the alpha terminal (real --link-workspace flag took effect)",
+  "beta does NOT see the alpha terminal (real selector workspace segment took effect)",
 );
 
 const alpha = await probe({ name: "probe-a", workspace: "alpha" });

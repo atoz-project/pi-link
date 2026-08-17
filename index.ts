@@ -256,13 +256,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerFlag("link-name", {
     description:
-      "Set the pi-link terminal name on startup (link identity only; does not affect session)",
-    type: "string",
-  });
-
-  pi.registerFlag("link-workspace", {
-    description:
-      "Set the pi-link home workspace on startup (fixed for the terminal's lifetime; undeclared = \"default\")",
+      "Set the pi-link membership selector [profile:][workspace/]name on startup (ADR-0009; link identity only, does not affect session)",
     type: "string",
   });
 
@@ -276,12 +270,6 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("link-budget", {
     description:
       "Set the pi-link context budget (absolute used-tokens ceiling, e.g. 56k) on startup; runtime-mutable via the link_budget tool",
-    type: "string",
-  });
-
-  pi.registerFlag("link-profile", {
-    description:
-      "Select the pi-link profile (fleet membership: dial url + token) on startup; beats PI_LINK_PROFILE and the profiles file default",
     type: "string",
   });
 
@@ -342,16 +330,17 @@ export default function (pi: ExtensionAPI) {
   // missing/mismatched, or the hub sent a version-rejection error before
   // close). Same semantics as authFailed; manual /link-connect resets.
   let versionRejected = false;
-  // ADR-0007: set when the selected profile name (--link-profile flag,
-  // PI_LINK_PROFILE, or the file's default) does not resolve. Fails closed:
+  // ADR-0007: set when the selected profile name (membership-string
+  // profile segment, or the file's default) does not resolve. Fails closed:
   // no dial, no promotion, no auto-reconnect — falling through to loopback
   // on a typo would be the 2026-08-17 fleet split with a different
   // spelling. /link-connect resets.
   let profileUnresolved = false;
-  // ADR-0007 amendment (#19): the --link-profile flag's selected NAME,
-  // prepending the resolution chain (flag > env > file default > none).
-  // Validated once at session_start; fixed for the terminal's lifetime.
-  let profileFlag: string | null = null;
+  // ADR-0009: the membership string's profile segment (--link-name flag
+  // > PI_LINK_NAME env), prepending the resolution chain (segment > file
+  // default > none). Validated once at session_start; fixed for the
+  // terminal's lifetime. Never persisted (ADR-0007 §6).
+  let profileSelected: string | null = null;
   // #7 item 1: set when startHub refused a non-loopback bind without a
   // token. Fail once, loudly; without the latch initialize() falls through
   // to scheduleReconnect and re-refuses every 2–5s forever. /link-connect
@@ -523,9 +512,9 @@ export default function (pi: ExtensionAPI) {
   // (user ruling: no env-var token override — env is visible in ps). A
   // profile is a complete fleet membership declaration: where to dial
   // (url; omitted = loopback) and what ticket to carry (token). Selection
-  // chain (#19 amendment): --link-profile flag > PI_LINK_PROFILE > default
-  // > none. Flag and env select a NAME; they never carry the URL fact
-  // (PI_LINK_URL is retired — ambient naked-URL dialing was the
+  // chain (ADR-0009): membership-string profile segment (flag > env) >
+  // default > none. The selector carries a NAME; it never carries the URL
+  // fact (PI_LINK_URL is retired — ambient naked-URL dialing was the
   // 2026-08-17 fleet split's legal entrance).
   // none (no file / no default) = loopback, no token — byte-identical
   // zero-config behavior.
@@ -583,8 +572,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Resolve THIS machine's profile: dial target + ticket, both from the one
-  // chosen profile. A selected name (--link-profile, PI_LINK_PROFILE, or the
-  // file's default) that does not resolve fails CLOSED — the caller must not
+  // chosen profile. A selected name (membership-string profile segment or
+  // the file's default) that does not resolve fails CLOSED — the caller
+  // must not
   // dial (a typo falling through to loopback would self-promote and split
   // the fleet). No selection = implicit local profile (loopback, no token).
   // Never throws.
@@ -592,8 +582,7 @@ export default function (pi: ExtensionAPI) {
     | { url: string; token: string | null; name: string | null }
     | { unresolved: string } {
     const profiles = loadProfilesFile();
-    const selected =
-      profileFlag || process.env.PI_LINK_PROFILE || profiles?.default;
+    const selected = profileSelected || profiles?.default;
     if (!selected)
       return { url: `ws://127.0.0.1:${LINK_PORT}`, token: null, name: null };
     const chosen = profiles?.profiles?.[selected];
@@ -769,10 +758,11 @@ export default function (pi: ExtensionAPI) {
     return i === -1 ? address : address.slice(0, i);
   }
 
-  // `/` and `*` are reserved in names and workspaces (address separator,
-  // broadcast wildcard) — rejected loudly at declaration and at register.
+  // `/`, `*` and `:` are reserved in names and workspaces (address
+  // separator, broadcast wildcard, profile separator — ADR-0009 amends
+  // ADR-0008 §8) — rejected loudly at declaration and at register.
   function hasReserved(s: string): boolean {
-    return /[/*]/.test(s);
+    return /[/*:]/.test(s);
   }
 
   // ADR-0008 §8 display badge: is this address a global member?
@@ -787,6 +777,61 @@ export default function (pi: ExtensionAPI) {
   function normalizeName(name: string | undefined | null): string | undefined {
     const n = name?.trim().replace(/\s+/g, " ");
     return n ? n : undefined;
+  }
+
+  // ADR-0009: parse the compact membership selector `[profile:][ws/]name`.
+  // `:` splits the profile from the address; the address follows ADR-0008
+  // (`workspace/name` or bare `name`). Every segment is optional — omitted
+  // segments fall through their own precedence chains independently.
+  // Malformed strings (empty segments, more than one `:` or `/`, reserved
+  // characters) fail closed with exit 1 — same posture as #19. `source`
+  // names the origin ("--link-name" / "PI_LINK_NAME") in the error.
+  function parseMembershipSelector(
+    raw: string,
+    source: string,
+  ): { profile?: string; workspace?: string; name?: string } {
+    function fail(msg: string): never {
+      console.error(`Error: ${source} ${msg}`);
+      process.exit(1);
+    }
+    const colonParts = raw.split(":");
+    if (colonParts.length > 2)
+      fail(`has more than one ":" (profile separator), got "${raw}".`);
+    let profile: string | undefined;
+    let address = raw;
+    if (colonParts.length === 2) {
+      profile = colonParts[0].trim();
+      address = colonParts[1].trim();
+      if (!profile)
+        fail(`has an empty profile segment (before ":"), got "${raw}".`);
+      if (!address)
+        fail(`has an empty address segment (after ":"), got "${raw}".`);
+    }
+    const slashParts = address.split("/");
+    let workspace: string | undefined;
+    let name: string;
+    if (slashParts.length === 1) {
+      name = slashParts[0].trim();
+    } else if (slashParts.length === 2) {
+      workspace = slashParts[0].trim();
+      name = slashParts[1].trim();
+      if (!workspace)
+        fail(`has an empty workspace segment (before "/"), got "${raw}".`);
+    } else {
+      fail(
+        `has more than one "/" in the address (name must not contain "/"), got "${raw}".`,
+      );
+    }
+    if (!name) fail(`has an empty name segment (after "/"), got "${raw}".`);
+    if (workspace && /[*:]/.test(workspace))
+      fail(
+        `workspace segment must not contain "*" or ":" (reserved characters), got "${workspace}".`,
+      );
+    if (/[*:]/.test(name))
+      fail(
+        `name segment must not contain "*" or ":" (reserved characters), got "${name}".`,
+      );
+    return { profile, workspace, name };
   }
 
   // Latest custom session entry of a given type (last-write-wins), or undefined.
@@ -1892,7 +1937,7 @@ export default function (pi: ExtensionAPI) {
           (regWorkspace && hasReserved(regWorkspace));
         if (malformed || reserved) {
           const reason = reserved
-            ? `reserved character "/" or "*" in name or workspace`
+            ? `reserved character "/", "*" or ":" in name or workspace`
             : `malformed v3 register (name, workspace, global, sessionId are required)`;
           clientWs.send(
             JSON.stringify({
@@ -2258,7 +2303,7 @@ export default function (pi: ExtensionAPI) {
       if ("unresolved" in cfg) {
         profileUnresolved = true;
         notify(
-          `Link profile "${cfg.unresolved}" does not resolve in ${PROFILES_FILE_PATH} — refusing to dial (no loopback fallback on a typo). Fix --link-profile, PI_LINK_PROFILE, or the profiles file, then /link-connect.`,
+          `Link profile "${cfg.unresolved}" does not resolve in ${PROFILES_FILE_PATH} — refusing to dial (no loopback fallback on a typo). Fix the membership string's profile segment or the profiles file, then /link-connect.`,
           "error",
         );
         resolve(false);
@@ -2567,30 +2612,37 @@ export default function (pi: ExtensionAPI) {
     // getSessionId.
     sessionId = _ctx.sessionManager.getSessionId?.() ?? sessionId;
 
-    // Resolve terminal name. Precedence:
-    //   --link-name flag  >  saved link-name  >  session name  >  random
-    //
-    // --link-name is the public CLI surface (link identity only, never
-    // touches session name). The wrapper's env-var name handoff is retired
-    // with the launcher's execution mode (ADR-0007 §8, #16) — no env path
-    // seeds link identity.
+    // Resolve the membership selector (ADR-0009). --link-name /
+    // PI_LINK_NAME carry `[profile:][workspace/]name`; each omitted
+    // segment falls through its own chain independently (per segment:
+    // flag > env). Malformed strings fail closed with exit 1 inside the
+    // parser. PI_LINK_NAME is consumed once and removed so spawned
+    // children don't inherit membership.
     const cliRaw = pi.getFlag("link-name");
-    let flagName: string | undefined;
+    const envRaw = process.env.PI_LINK_NAME;
+    delete process.env.PI_LINK_NAME;
+    let flagSel: ReturnType<typeof parseMembershipSelector> | undefined;
     if (typeof cliRaw === "string") {
-      flagName = normalizeName(cliRaw);
-      if (!flagName) {
+      const normalized = normalizeName(cliRaw);
+      if (!normalized) {
         console.error("Error: --link-name requires a non-empty value.");
         process.exit(1);
       }
-      // ADR-0008 §2: `/` and `*` are reserved (address separator, broadcast
-      // wildcard) — rejected loudly at declaration.
-      if (hasReserved(flagName)) {
-        console.error(
-          `Error: --link-name must not contain "/" or "*" (reserved address characters), got "${flagName}".`,
-        );
-        process.exit(1);
-      }
+      flagSel = parseMembershipSelector(normalized, "--link-name");
     }
+    const envNormalized = normalizeName(envRaw);
+    const envSel = envNormalized
+      ? parseMembershipSelector(envNormalized, "PI_LINK_NAME")
+      : undefined;
+    const flagName = flagSel?.name ?? envSel?.name;
+    const selWorkspace = flagSel?.workspace ?? envSel?.workspace;
+    profileSelected = flagSel?.profile ?? envSel?.profile ?? null;
+
+    // Resolve terminal name. Precedence:
+    //   selector name segment (flag > env)  >  saved link-name  >  session name  >  random
+    //
+    // --link-name is the public CLI surface (link identity only, never
+    // touches session name).
 
     if (flagName) {
       preferredName = flagName;
@@ -2618,7 +2670,7 @@ export default function (pi: ExtensionAPI) {
       // address model — ignore it (same precedent as malformed saved names).
       if (savedName && hasReserved(savedName)) {
         console.error(
-          `Link: ignoring saved link-name "${savedName}" (contains reserved "/" or "*") — set a new one with --link-name.`,
+          `Link: ignoring saved link-name "${savedName}" (contains reserved "/", "*" or ":") — set a new one with --link-name.`,
         );
         savedName = undefined;
       }
@@ -2634,46 +2686,20 @@ export default function (pi: ExtensionAPI) {
           terminalName = sessionName;
         } else if (sessionName) {
           console.error(
-            `Link: session name "${sessionName}" contains reserved "/" or "*" — using a random link name (set one with --link-name).`,
+            `Link: session name "${sessionName}" contains reserved "/", "*" or ":" — using a random link name (set one with --link-name).`,
           );
         }
       }
     }
 
-    // Resolve home workspace (ADR-0008 §1). Precedence mirrors link-name:
-    //   --link-workspace flag  >  PI_LINK_WORKSPACE env  >  saved link-workspace  >  "default"
+    // Resolve home workspace (ADR-0008 §1, chain amended by ADR-0009):
+    //   selector workspace segment (flag > env)  >  saved link-workspace  >  "default"
     // Undeclared no longer means privileged — it means the `default`
     // workspace, where zero-config loopback pairs still find each other.
-    // Fixed at startup — no runtime command, never derived from cwd. Empty
-    // after normalize = error (flag) / ignore (env, entry). Reserved
-    // characters (`/`, `*`) = startup error (flag AND env, exit 1) / ignored
-    // (saved entry — predates the address model). PI_LINK_WORKSPACE is
-    // consumed once and removed so spawned children don't inherit it.
-    const workspaceFlagRaw = pi.getFlag("link-workspace");
-    let workspaceFlag: string | undefined;
-    if (typeof workspaceFlagRaw === "string") {
-      workspaceFlag = normalizeName(workspaceFlagRaw);
-      if (!workspaceFlag) {
-        console.error("Error: --link-workspace requires a non-empty value.");
-        process.exit(1);
-      }
-      if (hasReserved(workspaceFlag)) {
-        console.error(
-          `Error: --link-workspace must not contain "/" or "*" (reserved address characters), got "${workspaceFlag}".`,
-        );
-        process.exit(1);
-      }
-    }
-    const workspaceEnvRaw = process.env.PI_LINK_WORKSPACE;
-    delete process.env.PI_LINK_WORKSPACE;
-    const workspaceEnv = normalizeName(workspaceEnvRaw);
-    if (workspaceEnv && hasReserved(workspaceEnv)) {
-      console.error(
-        `Error: PI_LINK_WORKSPACE must not contain "/" or "*" (reserved address characters), got "${workspaceEnv}".`,
-      );
-      process.exit(1);
-    }
-    const workspaceResolved = workspaceFlag ?? workspaceEnv;
+    // Fixed at startup — no runtime command, never derived from cwd.
+    // Reserved characters in the selector = startup error (exit 1, in the
+    // parser); in a saved entry = ignored (predates the address model).
+    const workspaceResolved = selWorkspace;
     if (workspaceResolved) {
       workspace = workspaceResolved;
       // Skip re-append when the saved entry already matches (same growth
@@ -2697,7 +2723,7 @@ export default function (pi: ExtensionAPI) {
       );
       if (savedWs && hasReserved(savedWs)) {
         console.error(
-          `Link: ignoring saved link-workspace "${savedWs}" (contains reserved "/" or "*") — landing in "${DEFAULT_WORKSPACE}".`,
+          `Link: ignoring saved link-workspace "${savedWs}" (contains reserved "/", "*" or ":") — landing in "${DEFAULT_WORKSPACE}".`,
         );
       }
       workspace =
@@ -2766,24 +2792,6 @@ export default function (pi: ExtensionAPI) {
         | { budget?: unknown }
         | undefined;
       declaredBudget = parseBudget(savedBudget?.budget) ?? null;
-    }
-
-    // Resolve the profile flag (ADR-0007 amendment, #19). The flag
-    // prepends the selection chain (flag > env > file default > none) and
-    // closes the ambient-env inheritance hole for explicit launch
-    // commands: PI_LINK_PROFILE leaks through tmux spawn chains, a flag
-    // does not. A NAME only, never a URL/token fact. Empty after trim =
-    // startup error, mirroring --link-name. No session entry — membership
-    // stays machine-level environment (ADR-0007 §6); the flag is
-    // per-process explicitness, not persistence.
-    const profileFlagRaw = pi.getFlag("link-profile");
-    if (typeof profileFlagRaw === "string") {
-      const trimmed = profileFlagRaw.trim();
-      if (!trimmed) {
-        console.error("Error: --link-profile requires a non-empty value.");
-        process.exit(1);
-      }
-      profileFlag = trimmed;
     }
 
     if (flagName || shouldConnect()) scheduleStartupConnect();
@@ -3740,6 +3748,14 @@ export default function (pi: ExtensionAPI) {
           if (cwd) text += "\n    " + theme.fg("dim", `cwd: ${shortenPath(cwd)}`);
         }
       }
+      // ADR-0009 §5: a scoped caller (no global grant) sees a clipped
+      // view — say so in one fixed line (no hidden-count; prompt-budget
+      // ruling).
+      if (!globalGrant)
+        text += theme.fg(
+          "dim",
+          "\nscoped view: showing home group + global members only",
+        );
       return new Text(text, 0, 0);
     },
   });
@@ -3818,7 +3834,7 @@ export default function (pi: ExtensionAPI) {
       // declaration (here: the rename command).
       if (hasReserved(newName)) {
         _ctx.ui.notify(
-          `Name "${newName}" contains a reserved character ("/" or "*") — pick another`,
+          `Name "${newName}" contains a reserved character ("/", "*" or ":") — pick another`,
           "warning",
         );
         return;

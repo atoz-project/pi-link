@@ -1,7 +1,9 @@
 // ADR-0007 §8 / issue #16 — launcher execution mode retired.
 // Drives bin/pi-link.mjs as a child process: `pi-link <name>` must refuse
 // with the two explicit recipes (spawning nothing), the query modes
-// (--list / --resolve) keep working, and PI_LINK_NAME is gone end-to-end.
+// (--list / --resolve) keep working. ADR-0009 note: PI_LINK_NAME returns
+// as the membership selector's env tier in the extension — the bin CLI
+// still never touches it (it does not parse membership flags).
 //
 // Run: node test/launcher-retired.mjs
 
@@ -143,15 +145,19 @@ writeFileSync(
   );
 }
 
-// ── PI_LINK_NAME handoff is gone end-to-end ─────────────────────────────────
+// ── PI_LINK_NAME: bin CLI stays clean; the extension owns the env tier ────
 
-console.log("PI_LINK_NAME removed");
+console.log("PI_LINK_NAME: bin clean, extension env tier");
 {
   const bin = readFileSync(BIN, "utf8");
   const ext = readFileSync(resolve(import.meta.dirname, "../index.ts"), "utf8");
   assert(
-    !bin.includes("PI_LINK_NAME") && !ext.includes("PI_LINK_NAME"),
-    "PI_LINK_NAME referenced nowhere in bin/ or index.ts",
+    !bin.includes("PI_LINK_NAME"),
+    "PI_LINK_NAME referenced nowhere in bin/ (bin does not parse membership flags)",
+  );
+  assert(
+    ext.includes("process.env.PI_LINK_NAME"),
+    "index.ts reads PI_LINK_NAME as the membership selector env tier (ADR-0009)",
   );
 }
 
