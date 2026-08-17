@@ -506,7 +506,7 @@ export default function (pi: ExtensionAPI) {
     const info =
       role === "disconnected"
         ? "link: offline"
-        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""} · ws:${workspace}${globalGrant ? " 🌐" : ""}${profile ? ` · ${profile}` : ""}`;
+        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""} · ws:${workspace}${globalGrant ? " · global" : ""}${profile ? ` · ${profile}` : ""}`;
     ui.setStatus("link", theme.fg("dim", info));
   }
 
@@ -1376,7 +1376,7 @@ export default function (pi: ExtensionAPI) {
         }
         updateStatus();
         notify(
-          `Joined link as "${terminalName}" ${viaText()} (${connectedTerminals.length} online) · workspace "${workspace}"${globalGrant ? " 🌐 global" : ""}`,
+          `Joined link as "${terminalName}" ${viaText()} (${connectedTerminals.length} online) · workspace "${workspace}"${globalGrant ? " global" : ""}`,
           "info",
         );
         pushStatus(true);
@@ -3728,7 +3728,7 @@ export default function (pi: ExtensionAPI) {
           const ctxStr = formatContext(details.contexts?.[name]);
           const model = details.models?.[name];
           let nameStr = `\u2022 ${short(name)}`;
-          if (globalSet.has(name)) nameStr += " \ud83c\udf10";
+          if (globalSet.has(name)) nameStr += " (global)";
           if (isSelf) nameStr += " (you)";
           text +=
             "\n  " +
@@ -3748,7 +3748,7 @@ export default function (pi: ExtensionAPI) {
   // idle duration prefers the hub-authoritative idle-since clock; the
   // over-budget marker is the link_list reminder surface (§2); the model
   // label shows raw (display may shorten) (§6). ADR-0008 §8: same-workspace
-  // addresses shorten to the bare name; global members get the 🌐 badge.
+  // addresses shorten to the bare name; global members get a ` (global)` badge.
   function terminalLine(address: string, bullet = "\u2022"): string {
     const status = getStatusFor(address);
     let statusStr = status ? formatStatus(status) : "";
@@ -3759,7 +3759,7 @@ export default function (pi: ExtensionAPI) {
     const ctxStr = formatContext(getContextFor(address));
     const over = overBudget(address) !== null;
     const model = getModelFor(address);
-    const badge = isGlobalAddr(address) ? " \ud83c\udf10" : "";
+    const badge = isGlobalAddr(address) ? " (global)" : "";
     const marker = address === myAddress() ? " (you)" : "";
     let line = `${bullet} ${displayName(address)}${badge}${marker}${statusStr ? "  " + statusStr : ""}`;
     if (ctxStr) line += `  \u00b7 ${ctxStr}`;
