@@ -310,6 +310,12 @@ await delay(300);
     res.details.models?.["default/hub"] === "anthropic/claude-opus-4:high",
     "hub's own model label listed",
   );
+  // #18: hub-identity line in the header, not per-terminal.
+  assert(
+    res.details.hub === `hub: local (implicit) → ws://127.0.0.1:${PORT}` &&
+      res.content[0].text.includes(res.details.hub),
+    `#18: link_list header hub line (got "${res.details.hub}")`,
+  );
 }
 
 // Mid-session thinking-level change propagates via status_update.

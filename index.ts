@@ -502,10 +502,11 @@ export default function (pi: ExtensionAPI) {
     if (!ui) return;
     const theme = ui.theme;
     const count = connectedTerminals.length;
+    const profile = hubIdentity().name; // #18: named-profile segment only
     const info =
       role === "disconnected"
         ? "link: offline"
-        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""} · ws:${workspace}${globalGrant ? " 🌐" : ""}`;
+        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""} · ws:${workspace}${globalGrant ? " 🌐" : ""}${profile ? ` · ${profile}` : ""}`;
     ui.setStatus("link", theme.fg("dim", info));
   }
 
@@ -588,17 +589,19 @@ export default function (pi: ExtensionAPI) {
   // the fleet). No selection = implicit local profile (loopback, no token).
   // Never throws.
   function resolveClientConfig():
-    | { url: string; token: string | null }
+    | { url: string; token: string | null; name: string | null }
     | { unresolved: string } {
     const profiles = loadProfilesFile();
     const selected =
       profileFlag || process.env.PI_LINK_PROFILE || profiles?.default;
-    if (!selected) return { url: `ws://127.0.0.1:${LINK_PORT}`, token: null };
+    if (!selected)
+      return { url: `ws://127.0.0.1:${LINK_PORT}`, token: null, name: null };
     const chosen = profiles?.profiles?.[selected];
     if (!chosen) return { unresolved: selected };
     return {
       url: chosen.url ?? `ws://127.0.0.1:${LINK_PORT}`,
       token: chosen.token ?? null,
+      name: selected,
     };
   }
 
@@ -607,6 +610,29 @@ export default function (pi: ExtensionAPI) {
   function resolveHubToken(): string | null {
     const cfg = resolveClientConfig();
     return "unresolved" in cfg ? null : cfg.token;
+  }
+
+  // #18: this terminal's hub identity, for display surfaces only — client-local
+  // knowledge (selection chain + resolved URL); nothing rides the wire, the
+  // protocol version is untouched. name = selected profile name, or null for
+  // the zero-config implicit loopback; url = the actual dial/bind target.
+  function hubIdentity(): { name: string | null; url: string } {
+    const cfg = resolveClientConfig();
+    if ("unresolved" in cfg) return { name: null, url: "" };
+    return {
+      name: cfg.name,
+      url:
+        resolvedHubUrl ??
+        (role === "hub" ? `ws://${resolveHubHost()}:${LINK_PORT}` : cfg.url),
+    };
+  }
+
+  // #18 display phrasing: named profile → "via fleet → wss://hub:9900";
+  // zero-config loopback → "via local (implicit) → ws://127.0.0.1:9900".
+  function viaText(): string {
+    const id = hubIdentity();
+    const label = id.name ?? "local (implicit)";
+    return id.url ? `via ${label} → ${id.url}` : `via ${label}`;
   }
 
   // sha256 digest of a token, as a 32-byte Buffer. Used for timing-safe
@@ -1350,7 +1376,7 @@ export default function (pi: ExtensionAPI) {
         }
         updateStatus();
         notify(
-          `Joined link as "${terminalName}" (${connectedTerminals.length} online) · workspace "${workspace}"${globalGrant ? " 🌐 global" : ""}`,
+          `Joined link as "${terminalName}" ${viaText()} (${connectedTerminals.length} online) · workspace "${workspace}"${globalGrant ? " 🌐 global" : ""}`,
           "info",
         );
         pushStatus(true);
@@ -2198,7 +2224,7 @@ export default function (pi: ExtensionAPI) {
         updateStatus();
         const authSuffix = resolvedToken ? " (auth: token required)" : "";
         notify(
-          `Link hub started on ${bindHost}:${LINK_PORT} as "${terminalName}"${authSuffix}`,
+          `Link hub started on ${bindHost}:${LINK_PORT} as "${terminalName}" via ${hubIdentity().name ?? "local (implicit)"}${authSuffix}`,
           "info",
         );
         startHeartbeat();
@@ -3635,7 +3661,9 @@ export default function (pi: ExtensionAPI) {
         sections.push(`${group === workspace ? `${group} (home)` : group}\n${members}`);
       }
 
-      return textResult(`Connected terminals:\n${sections.join("\n")}`, {
+      const hid = hubIdentity(); // #18: one hub-identity line, not per-terminal
+      const hubLine = `hub: ${hid.name ?? "local (implicit)"} → ${hid.url}`;
+      return textResult(`Connected terminals · ${hubLine}\n${sections.join("\n")}`, {
         terminals: connectedTerminals,
         globals: connectedTerminals.filter(isGlobalAddr),
         statuses,
@@ -3646,6 +3674,7 @@ export default function (pi: ExtensionAPI) {
         self: myAddress(),
         workspace,
         role,
+        hub: hubLine,
       });
     },
 
@@ -3662,6 +3691,7 @@ export default function (pi: ExtensionAPI) {
             self?: string;
             workspace?: string;
             role?: string;
+            hub?: string;
           }
         | undefined;
       if (!details?.terminals) {
@@ -3682,6 +3712,7 @@ export default function (pi: ExtensionAPI) {
       let text = theme.fg("toolTitle", theme.bold("link "));
       text += theme.fg("muted", `(${details.role}) `);
       text += theme.fg("accent", `${details.terminals.length} terminal(s)`);
+      if (details.hub) text += theme.fg("dim", `  · ${details.hub}`);
       const overSet = new Set(details.overBudget ?? []);
       for (const group of groups) {
         text +=
@@ -3752,8 +3783,9 @@ export default function (pi: ExtensionAPI) {
         if (cwd) line += `\n  cwd: ${shortenPath(cwd)}`;
         return line;
       });
+      const hid = hubIdentity(); // #18: hub identity rides the header line
       _ctx.ui.notify(
-        `Link: ${terminalName} (${role}) · ${connectedTerminals.length} online\n${lines.join("\n")}`,
+        `Link: ${terminalName} (${role}) · ${connectedTerminals.length} online · hub: ${hid.name ?? "local (implicit)"} → ${hid.url}\n${lines.join("\n")}`,
         "info",
       );
     },

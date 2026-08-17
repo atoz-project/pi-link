@@ -383,7 +383,7 @@ Working directories use full absolute paths in tool output. In the TUI (`/link`)
 **Example output:**
 
 ```
-Connected terminals:
+Connected terminals · hub: local (implicit) → ws://127.0.0.1:9900
   • opus@pi-link (you)  idle (12s)  · 45K/272K (17%)
     cwd: C:\Users\andre\.pi
   • gpt@pi-link  thinking (3s)  · ?/272K
@@ -481,8 +481,10 @@ The six tools compose into coordination shapes worth naming:
 ✓ Disconnected from link
 
 > /link-connect
-✓ Joined link as "orchestrator" (3 online)
+✓ Joined link as "orchestrator" via local (implicit) → ws://127.0.0.1:9900 (3 online) · workspace "default"
 ```
+
+**Hub identity — which island am I on?** The join banner, the `link_list`/`/link` header, and (when a named profile is selected) the status bar all show this terminal's resolved hub: `via <profile> → ws://host:port`, with zero-config loopback reading `via local (implicit) → ws://127.0.0.1:9900`. The hub-start line names its profile too. It's purely client-local knowledge (selection chain + resolved URL) — nothing rides the wire — and it turns cross-machine config drift (machine A's `default` → hubA, machine B's → hubB) from a silent split into a one-glance tell (#18).
 
 With no argument, `/link-name` adopts the Pi session name. `/link-connect` joins an existing hub if one is running; otherwise it starts the hub.
 
