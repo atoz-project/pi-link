@@ -211,6 +211,14 @@ await waitFor(
   "joined after fix",
 );
 assert(true, "/link-connect retries after the config is fixed");
+assert(
+  t1.notifications.some(
+    (n) =>
+      n.message.includes("Joined link") &&
+      n.message.includes("via fleet → ws://127.0.0.1:19913"),
+  ),
+  "#18: join banner names the env-selected profile + dialed url",
+);
 await t1.handlers.session_shutdown();
 delete process.env.PI_LINK_PROFILE;
 
@@ -232,6 +240,16 @@ assert(
   f2.registers[0].token === "tok-default",
   "no env: default profile's url dialed with its token",
 );
+await waitFor(
+  () =>
+    t2.notifications.some(
+      (n) =>
+        n.message.includes("Joined link") &&
+        n.message.includes("via fleet → ws://127.0.0.1:19914"),
+    ),
+  "#18: join banner names the default profile + dialed url",
+);
+assert(true, "banner (default profile)");
 await t2.handlers.session_shutdown();
 
 // ── Scenario 3: PI_LINK_URL is dead; zero-config loopback unchanged ─────────
@@ -254,6 +272,14 @@ assert(
   t3.notifications.some((n) => n.message.includes(`127.0.0.1:${PORT}`)) &&
     !t3.notifications.some((n) => n.message.includes("auth: token required")),
   "no profiles file → loopback unauthenticated hub (zero-config unchanged)",
+);
+assert(
+  t3.notifications.some(
+    (n) =>
+      n.message.includes("Link hub started") &&
+      n.message.includes("via local (implicit)"),
+  ),
+  "#18: hub banner reads via local (implicit) with no profiles file",
 );
 delete process.env.PI_LINK_URL;
 await t3.handlers.session_shutdown();
@@ -280,6 +306,13 @@ await waitFor(
   "loopback promotion with token auth",
 );
 assert(true, "url omitted → loopback dial; promoted hub requires the profile token");
+assert(
+  t4.notifications.some(
+    (n) =>
+      n.message.includes("Link hub started") && n.message.includes("via local"),
+  ),
+  "#18: hub banner names the url-omitted default profile",
+);
 
 const bad = await new Promise((resolve) => {
   const s = new WebSocket(`ws://127.0.0.1:${PORT}`);
@@ -459,6 +492,13 @@ await waitFor(
   "loopback promotion with the flag profile's token",
 );
 assert(true, "resolveHubToken follows the flag tier");
+assert(
+  t9.notifications.some(
+    (n) =>
+      n.message.includes("Link hub started") && n.message.includes("via localf"),
+  ),
+  "#18: hub banner names the flag-selected profile",
+);
 const good9 = await rawClient({ name: "g9", token: "flag-secret" });
 assert(good9.welcome.name === "g9", "register with the flag profile token welcomed");
 good9.ws.close();
