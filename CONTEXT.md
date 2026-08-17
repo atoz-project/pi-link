@@ -88,8 +88,10 @@ A named fleet membership declaration in `~/.pi/agent/pi-link.json` (mode
 0600): the dial target (`url`; omitted = loopback) plus the fleet's shared
 token — one resolved profile answers both "where" and "what ticket"
 (ADR-0007, amending ADR-0002's match-key role). Selected at spawn:
-`--link-profile` > `PI_LINK_PROFILE` > `default` > none (flag tier added
-by the #19 amendment); an unknown name fails closed. The
+`default` > none; an unknown name fails closed. The selector surface is
+the **membership string** (ADR-0009): `--link-name` / `PI_LINK_NAME` accept
+`[profile:][workspace/]name`, each omitted segment falling through its own
+chain. The
 `default` profile is the machine's answer to "where is my fleet?" — on the
 hub's own machine the answer is loopback. No profile means loopback-only,
 unauthenticated, pre-ADR-0002 behavior. Membership is machine-level
@@ -117,8 +119,9 @@ _Avoid_: tenant, scope
 
 **Home workspace**:
 The workspace a terminal lives in — its name's uniqueness scope and the
-first half of its address. Every terminal has exactly one: `--link-workspace`
-> `PI_LINK_WORKSPACE` > persisted session entry > `default`. Fixed for the
+first half of its address. Every terminal has exactly one: the workspace
+segment of the membership string (flag > env) > persisted session entry >
+`default`. Fixed for the
 terminal's lifetime, never derived from cwd; undeclared means the `default`
 workspace, not privilege (ADR-0008, superseding ADR-0004's optional
 workspace / global-observer-by-omission).
@@ -136,8 +139,9 @@ _Avoid_: admin, superuser, global observer (the by-omission form is retired)
 `from`/`to` is fully qualified. A bare name in a tool call resolves in the
 sender's own workspace only (no scope chain); cross-workspace addressing is
 always spelled qualified. `workspace/*` broadcasts to one group (globals
-only, for foreign groups). `/` and `*` are reserved characters in names and
-workspaces. Display shortens same-workspace addresses (ADR-0008).
+only, for foreign groups). `/`, `*`, and `:` are reserved characters in
+names and workspaces (`:` splits the profile segment, ADR-0009). Display
+shortens same-workspace addresses (ADR-0008).
 _Avoid_: path, FQDN
 
 **Takeover**:
