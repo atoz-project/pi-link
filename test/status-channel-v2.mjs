@@ -27,7 +27,7 @@ process.env.PI_LINK_PROFILES_FILE = PROFILES_FILE;
 const { default: createLink } = await import("../index.ts");
 
 const PORT = 19902;
-const VERSION = 2; // LINK_PROTOCOL_VERSION in index.ts
+const VERSION = 3; // LINK_PROTOCOL_VERSION in index.ts
 let failures = 0;
 
 function assert(cond, label) {
@@ -151,7 +151,14 @@ function rawClient(register, port = PORT) {
     });
     ws.on("open", () =>
       ws.send(
-        JSON.stringify({ type: "register", version: VERSION, ...register }),
+        JSON.stringify({
+          type: "register",
+          version: VERSION,
+          workspace: "default",
+          global: false,
+          sessionId: `raw-${Math.random().toString(36).slice(2, 10)}`,
+          ...register,
+        }),
       ),
     );
     ws.on("error", reject);
@@ -167,7 +174,7 @@ const toolText = (result) => result.content[0].text;
 console.log("scenario 1: version gate");
 
 const hub = await startTerminal(
-  { link: true, "link-name": "hub" },
+  { link: true, "link-name": "hub", "link-global": true },
   { model: { provider: "anthropic", id: "claude-opus-4" }, thinkingLevel: "high" },
 );
 await waitFor(
@@ -190,6 +197,32 @@ await waitFor(
   );
   await delay(200);
   assert(ws.readyState === WebSocket.CLOSED, "hub closes the gated socket");
+}
+
+// Register with the previous version → error + close (ADR-0008: one wave).
+{
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
+  const got = await new Promise((resolve) => {
+    ws.on("message", (raw) => resolve(JSON.parse(raw.toString())));
+    ws.on("open", () =>
+      ws.send(
+        JSON.stringify({
+          type: "register",
+          name: "v2-client",
+          version: 2,
+          workspace: "default",
+          global: false,
+          sessionId: "raw-v2",
+        }),
+      ),
+    );
+  });
+  assert(
+    got.type === "error" && /protocol version rejected/i.test(got.message),
+    "hub refuses a v2 register loudly (fleet upgrades together)",
+  );
+  await delay(200);
+  assert(ws.readyState === WebSocket.CLOSED, "hub closes the v2 socket");
 }
 
 // ── Scenario 2: version gate, client side (old hub without echo) ────────────
@@ -262,7 +295,7 @@ await waitFor(
   () => worker.notifications.find((n) => n.message.includes("Joined link")),
   "worker join",
 );
-const g = await rawClient({ name: "g" }); // global observer
+const g = await rawClient({ name: "g", global: true }); // global grant
 const r = await rawClient({ name: "r", workspace: "beta" }); // other group
 await delay(300);
 
@@ -270,11 +303,11 @@ await delay(300);
 {
   const res = await hub.tools.link_list.execute("t", {}, undefined);
   assert(
-    res.details.models?.w === "openai/gpt-5:high",
-    `model label in link_list (got ${res.details.models?.w})`,
+    res.details.models?.["alpha/w"] === "openai/gpt-5:high",
+    `model label in link_list (got ${res.details.models?.["alpha/w"]})`,
   );
   assert(
-    res.details.models?.hub === "anthropic/claude-opus-4:high",
+    res.details.models?.["default/hub"] === "anthropic/claude-opus-4:high",
     "hub's own model label listed",
   );
 }
@@ -286,7 +319,7 @@ await delay(300);
 {
   const res = await hub.tools.link_list.execute("t", {}, undefined);
   assert(
-    res.details.models?.w === "openai/gpt-5:max",
+    res.details.models?.["alpha/w"] === "openai/gpt-5:max",
     "thinking_level_select re-push updates the peer label",
   );
 }
@@ -299,7 +332,7 @@ await delay(300);
 {
   const res = await hub.tools.link_send.execute(
     "t",
-    { to: "w", message: "m1", triggerTurn: false },
+    { to: "alpha/w", message: "m1", triggerTurn: false },
     undefined,
   );
   assert(
@@ -313,13 +346,13 @@ await delay(300);
 {
   const res = await hub.tools.link_send.execute(
     "t",
-    { to: "w", message: "m2", triggerTurn: false },
+    { to: "alpha/w", message: "m2", triggerTurn: false },
     undefined,
   );
   const text = toolText(res);
   assert(
     text.includes(
-      '⚠ "w" over budget: 156K/156K — decide whether to link_compact (or link_new)',
+      '⚠ "alpha/w" over budget: 156K/156K — decide whether to link_compact (or link_new)',
     ),
     `default budget fires at window−100K with blunt wording (got "${text}")`,
   );
@@ -338,11 +371,11 @@ assert(
 {
   const res = await hub.tools.link_budget.execute(
     "t",
-    { to: "w", budget: 56_000 },
+    { to: "alpha/w", budget: 56_000 },
     undefined,
   );
   assert(
-    toolText(res).includes('Budget on "w" set to 56K') && !res.details.error,
+    toolText(res).includes('Budget on "alpha/w" set to 56K') && !res.details.error,
     `link_budget set acks ✓ (got "${toolText(res)}")`,
   );
   assert(
@@ -354,7 +387,7 @@ assert(
   await delay(300);
   const list = await hub.tools.link_list.execute("t", {}, undefined);
   assert(
-    list.details.overBudget?.includes("w"),
+    list.details.overBudget?.includes("alpha/w"),
     "link_list marker: worker over declared 56K at 156K tokens",
   );
 }
@@ -367,27 +400,27 @@ await delay(300);
 {
   const over = await hub.tools.link_send.execute(
     "t",
-    { to: "w", message: "m3", triggerTurn: false },
+    { to: "alpha/w", message: "m3", triggerTurn: false },
     undefined,
   );
   assert(
-    toolText(over).includes('⚠ "w" over budget: 61K/56K'),
+    toolText(over).includes('⚠ "alpha/w" over budget: 61K/56K'),
     `declared 56K fires at 61K (got "${toolText(over)}")`,
   );
   const overrideUnder = await hub.tools.link_send.execute(
     "t",
-    { to: "w", message: "m4", triggerTurn: false, budget: 70_000 },
+    { to: "alpha/w", message: "m4", triggerTurn: false, budget: 70_000 },
     undefined,
   );
   const text = toolText(overrideUnder);
   assert(
     !text.includes("over budget") &&
-      text.includes("budget mismatch: dispatch 70K vs \"w\" declared 56K"),
+      text.includes("budget mismatch: dispatch 70K vs \"alpha/w\" declared 56K"),
     `per-dispatch 70K overrides for one exchange + mismatch notice (got "${text}")`,
   );
   const after = await hub.tools.link_send.execute(
     "t",
-    { to: "w", message: "m5", triggerTurn: false },
+    { to: "alpha/w", message: "m5", triggerTurn: false },
     undefined,
   );
   assert(
@@ -401,7 +434,7 @@ await delay(300);
 {
   const promptPromise = hub.tools.link_prompt.execute(
     "t",
-    { to: "w", prompt: "ping" },
+    { to: "alpha/w", prompt: "ping" },
     undefined,
   );
   await delay(300); // let the request land on the worker
@@ -412,9 +445,9 @@ await delay(300);
   const res = await promptPromise;
   const text = toolText(res);
   assert(
-    text.startsWith('⚠ "w" over budget: 61K/56K') &&
+    text.startsWith('⚠ "alpha/w" over budget: 61K/56K') &&
       text.includes("pong") &&
-      /\[61K\/256K \(24%\) · ⚠ "w" over budget: 61K\/56K/.test(text),
+      /\[61K\/256K \(24%\) · ⚠ "alpha\/w" over budget: 61K\/56K/.test(text),
     `link_prompt: pre-dispatch line + response readout verdict (got "${text}")`,
   );
 }
@@ -423,7 +456,7 @@ await delay(300);
 {
   const res = await hub.tools.link_budget.execute(
     "t",
-    { to: "w", budget: "off" },
+    { to: "alpha/w", budget: "off" },
     undefined,
   );
   assert(
@@ -439,7 +472,7 @@ await delay(300);
   await delay(300);
   const list = await hub.tools.link_list.execute("t", {}, undefined);
   assert(
-    !list.details.overBudget?.includes("w"),
+    !list.details.overBudget?.includes("alpha/w"),
     "61K tokens under default 156K after off",
   );
 }
@@ -454,7 +487,7 @@ await delay(300);
   assert(ghost.details.error === "not_found", "link_budget → not_found");
   const cross = await worker.tools.link_budget.execute(
     "t",
-    { to: "r", budget: 1000 },
+    { to: "beta/r", budget: 1000 },
     undefined,
   );
   assert(
@@ -467,30 +500,30 @@ await delay(300);
 // joiners), busy clears it, busy→idle re-sets — all hub-clock.
 {
   assert(
-    typeof g.welcome.idleSince?.w === "number" &&
-      typeof g.welcome.idleSince?.hub === "number",
+    typeof g.welcome.idleSince?.["alpha/w"] === "number" &&
+      typeof g.welcome.idleSince?.["default/hub"] === "number",
     "welcome snapshot carries idle-since for idle terminals",
   );
   send(g, {
     type: "status_update",
-    name: "g",
+    name: "default/g",
     status: { kind: "thinking", since: Date.now() },
     budget: null,
     model: null,
   });
   await delay(300);
-  let fanned = ofType(r, "status_update").filter((m) => m.name === "g").at(-1);
+  let fanned = ofType(r, "status_update").filter((m) => m.name === "default/g").at(-1);
   assert(fanned?.idleSince === null, "busy clears idle-since in the fan-out");
   send(g, {
     type: "status_update",
-    name: "g",
+    name: "default/g",
     status: { kind: "idle", since: 1 }, // client clock says 1 — hub clock wins
     budget: null,
     model: null,
     junk: "dropped-by-whitelist",
   });
   await delay(300);
-  fanned = ofType(r, "status_update").filter((m) => m.name === "g").at(-1);
+  fanned = ofType(r, "status_update").filter((m) => m.name === "default/g").at(-1);
   assert(
     typeof fanned?.idleSince === "number" && fanned.idleSince > 1,
     "busy→idle re-sets idle-since on the hub clock",
@@ -501,8 +534,8 @@ await delay(300);
   );
   const list = await hub.tools.link_list.execute("t", {}, undefined);
   assert(
-    /idle \(\ds\)/.test(list.details.statuses?.g ?? ""),
-    `link_list shows idle duration from the hub clock (got "${list.details.statuses?.g}")`,
+    /idle \(\ds\)/.test(list.details.statuses?.["default/g"] ?? ""),
+    `link_list shows idle duration from the hub clock (got "${list.details.statuses?.["default/g"]}")`,
   );
 }
 
@@ -510,14 +543,14 @@ await delay(300);
 // through the command path and pre-writes identity into the new session.
 {
   await worker.handlers.agent_start({}, worker.ctx);
-  const busy = await hub.tools.link_new.execute("t", { to: "w" }, undefined);
+  const busy = await hub.tools.link_new.execute("t", { to: "alpha/w" }, undefined);
   assert(
     busy.details.error === "busy",
     `busy target declines link_new (got "${toolText(busy)}")`,
   );
   await worker.handlers.agent_end({ messages: [] }, worker.ctx);
 
-  const res = await hub.tools.link_new.execute("t", { to: "w" }, undefined);
+  const res = await hub.tools.link_new.execute("t", { to: "alpha/w" }, undefined);
   assert(
     !res.details.error &&
       toolText(res).includes("sess-old-123") &&

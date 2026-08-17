@@ -50,9 +50,14 @@ const HEARTBEAT_INTERVAL_MS = 60_000;
 const DEFAULT_BUDGET_RESERVE = 100_000;
 // ADR-0005 §8: protocol version gate. Rides register, echoed in welcome;
 // missing/mismatched on either side → loud refusal, no auto-reconnect.
-// Within a versioned link every v2 field is guaranteed present — no
+// Within a versioned link every field below is guaranteed present — no
 // per-field fallback paths. Bump on any breaking wire change.
-const LINK_PROTOCOL_VERSION = 2;
+// ADR-0008: v3 — qualified addresses (workspace/name), sessionId takeover,
+// global grant; the hub never renames.
+const LINK_PROTOCOL_VERSION = 3;
+// ADR-0008: an undeclared home workspace lands in "default" (zero-config
+// loopback pairs still find each other) — omission is no longer privilege.
+const DEFAULT_WORKSPACE = "default";
 const BUDGET_TIMEOUT_MS = 30_000;
 const NEW_TIMEOUT_MS = 30_000;
 // ADR-0002 public-reachable hub auth. Loopback host set (host not in it
@@ -79,11 +84,15 @@ interface RegisterMsg {
   cwd?: string;
   context?: ContextSnapshot;
   // ADR-0002: optional shared-token auth. Present when the client resolved a
-  // profile token; absent otherwise. Old hubs ignore unknown fields
-  // (fork-first, upstream PR later).
+  // profile token; absent otherwise.
   token?: string;
-  // ADR-0004: optional workspace declaration. Absent = global observer.
-  workspace?: string;
+  // ADR-0008 v3: the two identity axes + the session anchor. Guaranteed
+  // present past the version gate — the client sends its resolved home
+  // (undeclared = "default"), its self-declared grant, and its pi session
+  // id (the takeover anchor; the hub never renames).
+  workspace: string;
+  global: boolean;
+  sessionId: string;
   // ADR-0005: version gate + status-channel v2 fields. Guaranteed present
   // within a versioned link (null = default/none, never absent).
   version: number;
@@ -92,15 +101,16 @@ interface RegisterMsg {
 }
 interface WelcomeMsg {
   type: "welcome";
-  name: string;
-  terminals: string[];
+  name: string; // bare name echo (the terminal's own name)
+  terminals: string[]; // qualified addresses, cut to the joiner's visible set
   statuses?: Record<string, LinkStatus>;
   cwds?: Record<string, string>;
   contexts?: Record<string, ContextSnapshot>;
-  // ADR-0004: echoes the effective workspace (absent = global observer).
-  // ADR-0005: this is now an effective-value readback only — the version
-  // gate below is the wire's compatibility mechanism.
-  workspace?: string;
+  // ADR-0008 v3: effective-value echoes of both axes, guaranteed present —
+  // the fail-closed membership handshake extends to home × grant.
+  workspace: string; // effective home workspace
+  global: boolean; // effective global grant
+  globals: string[]; // visible global members (qualified addresses)
   // ADR-0005: echoed protocol version (the gate) + v2 snapshots, all cut to
   // the joiner's visible set.
   version: number;
@@ -110,16 +120,19 @@ interface WelcomeMsg {
 }
 interface TerminalJoinedMsg {
   type: "terminal_joined";
-  name: string;
+  name: string; // qualified address
   terminals: string[];
+  global: boolean; // ADR-0008: the joiner's grant (display badge)
   cwd?: string;
   context?: ContextSnapshot;
 }
 interface TerminalLeftMsg {
   type: "terminal_left";
-  name: string;
+  name: string; // qualified address
   terminals: string[];
 }
+// ADR-0008: on the wire every from/to is a fully qualified address
+// (workspace/name); "*" broadcasts, "workspace/*" targets one group.
 interface ChatMsg {
   type: "chat";
   from: string;
@@ -249,8 +262,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerFlag("link-workspace", {
     description:
-      "Set the pi-link workspace (visibility group) on startup; fixed for the terminal's lifetime",
+      "Set the pi-link home workspace on startup (fixed for the terminal's lifetime; undeclared = \"default\")",
     type: "string",
+  });
+
+  pi.registerFlag("link-global", {
+    description:
+      "Declare the pi-link global grant on startup (see/reach/be reached by everyone; self-declared within the trust domain)",
+    type: "boolean",
+    default: false,
   });
 
   pi.registerFlag("link-budget", {
@@ -292,13 +312,27 @@ export default function (pi: ExtensionAPI) {
   // Whether the plaintext-warning has fired this session (ADR-0002 §1:
   // exactly once per session, not per reconnect).
   let plaintextWarningFired = false;
-  // ADR-0004: this terminal's declared workspace (null = global observer).
-  // Resolved once at session_start; fixed for the terminal's lifetime.
-  let workspace: string | null = null;
-  // ADR-0004: set when the hub's welcome failed the workspace handshake
-  // (requested a workspace but the echo was missing/mismatched = the hub
-  // cannot honor isolation, e.g. an old hub). Same semantics as authFailed:
-  // rejection ≠ hub loss — no auto-reconnect; manual /link-connect resets.
+  // ADR-0008: this terminal's home workspace — always set (undeclared =
+  // "default": omission is residency, not privilege). Resolved once at
+  // session_start; fixed for the terminal's lifetime.
+  let workspace: string = DEFAULT_WORKSPACE;
+  // ADR-0008: the second axis — self-declared global grant (see everyone,
+  // reach everyone, be reachable by everyone). Fixed at startup; rides the
+  // session file and link_new's pre-write like name and workspace.
+  let globalGrant = false;
+  // ADR-0008: pi session id — the identity anchor register carries for the
+  // takeover decision. Random fallback until session_start resolves it.
+  let sessionId = `anon-${crypto.randomUUID()}`;
+  // ADR-0008: set when the hub refused our register for identity reasons —
+  // the (workspace, name) is held by a different sessionId, the declaration
+  // carried reserved characters, or a required v3 field was missing. Same
+  // semantics as authFailed: loud notify, no auto-reconnect; manual
+  // /link-connect resets.
+  let nameTaken = false;
+  // ADR-0008: set when the hub's welcome failed the identity handshake
+  // (effective home or grant echo missing/mismatched = the hub cannot honor
+  // the address model). Same semantics as authFailed: rejection ≠ hub loss —
+  // no auto-reconnect; manual /link-connect resets.
   let workspaceRejected = false;
   // ADR-0005: declared context budget (null = default: window − reserve).
   // Resolved at session_start (flag > env > saved entry); runtime-mutable
@@ -339,14 +373,18 @@ export default function (pi: ExtensionAPI) {
   const terminalBudgets = new Map<string, number>(); // declared (absent = default)
   const terminalModels = new Map<string, string>();
   const terminalIdleSince = new Map<string, number>(); // hub clock
+  // ADR-0008: visible global members (qualified addresses) — the badge set.
+  const terminalGlobals = new Set<string>();
 
   // Hub state
   let wss: WebSocketServer | null = null;
-  const hubClients = new Map<WebSocket, string>(); // ws → terminal name
+  const hubClients = new Map<WebSocket, string>(); // ws → qualified address
   const hubTerminalStatuses = new Map<string, LinkStatus>(); // hub-authoritative
   const hubTerminalContexts = new Map<string, ContextSnapshot>(); // hub-authoritative
   const hubTerminalCwds = new Map<string, string>(); // hub-authoritative (excludes self)
-  const hubTerminalWorkspaces = new Map<string, string>(); // hub-authoritative (excludes self)
+  const hubTerminalWorkspaces = new Map<string, string>(); // hub-authoritative (excludes self; always set in v3)
+  const hubTerminalGlobals = new Set<string>(); // hub-authoritative (excludes self)
+  const hubTerminalSessionIds = new Map<string, string>(); // hub-authoritative takeover anchor (excludes self)
   const hubTerminalBudgets = new Map<string, number>(); // hub-authoritative (excludes self)
   const hubTerminalModels = new Map<string, string>(); // hub-authoritative (excludes self)
   const hubIdleSince = new Map<string, number>(); // hub-authoritative clock (excludes self)
@@ -467,7 +505,7 @@ export default function (pi: ExtensionAPI) {
     const info =
       role === "disconnected"
         ? "link: offline"
-        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""}${workspace ? ` · ws:${workspace}` : ""}`;
+        : `link: ${terminalName} (${role}) · ${count} terminal${count !== 1 ? "s" : ""} · ws:${workspace}${globalGrant ? " 🌐" : ""}`;
     ui.setStatus("link", theme.fg("dim", info));
   }
 
@@ -636,7 +674,7 @@ export default function (pi: ExtensionAPI) {
     const context = captureContext(); // only when we actually send
     const msg: StatusUpdateMsg = {
       type: "status_update",
-      name: terminalName,
+      name: myAddress(),
       status,
       context: context ?? null, // explicit null tells peers to clear
       budget: declaredBudget,
@@ -649,7 +687,7 @@ export default function (pi: ExtensionAPI) {
         : {}),
     };
     if (role === "hub") {
-      hubBroadcast(msg, terminalName, terminalName);
+      hubBroadcast(msg, myAddress(), myAddress());
     } else if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
@@ -672,6 +710,50 @@ export default function (pi: ExtensionAPI) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
     }
+  }
+
+  // ── ADR-0008 qualified addresses ────────────────────────────────────
+
+  // This terminal's wire identity: home workspace × name. Every protocol
+  // from/to is fully qualified — no ambiguity, ever.
+  function myAddress(): string {
+    return `${workspace}/${terminalName}`;
+  }
+
+  // ADR-0008 §4: a bare `to` resolves in the sender's own workspace only —
+  // never a scope chain (own group, then globals): shadowing is exactly the
+  // drift this redesign kills. Qualified targets pass through untouched.
+  function qualifyTo(to: string): string {
+    return to.includes("/") ? to : `${workspace}/${to}`;
+  }
+
+  // Display surfaces shorten same-workspace addresses (the wire stays
+  // qualified). Cross-workspace addresses always show in full.
+  function displayName(address: string): string {
+    const i = address.indexOf("/");
+    return i > 0 && address.slice(0, i) === workspace
+      ? address.slice(i + 1)
+      : address;
+  }
+
+  // Home workspace of a qualified address (everything before the first `/` —
+  // reserved-character rejection makes the split unambiguous).
+  function addressWs(address: string): string {
+    const i = address.indexOf("/");
+    return i === -1 ? address : address.slice(0, i);
+  }
+
+  // `/` and `*` are reserved in names and workspaces (address separator,
+  // broadcast wildcard) — rejected loudly at declaration and at register.
+  function hasReserved(s: string): boolean {
+    return /[/*]/.test(s);
+  }
+
+  // ADR-0008 §8 display badge: is this address a global member?
+  function isGlobalAddr(address: string): boolean {
+    if (address === myAddress()) return globalGrant;
+    const set = role === "hub" ? hubTerminalGlobals : terminalGlobals;
+    return set.has(address);
   }
 
   // Canonicalize a link/session name: trim + collapse internal whitespace.
@@ -744,24 +826,24 @@ export default function (pi: ExtensionAPI) {
     return `${formatTokens(c.tokens)}/${window} (${percent}%)`;
   }
 
-  function getDeclaredBudgetFor(name: string): number | null {
-    if (name === terminalName) return declaredBudget;
+  function getDeclaredBudgetFor(address: string): number | null {
+    if (address === myAddress()) return declaredBudget;
     const map = role === "hub" ? hubTerminalBudgets : terminalBudgets;
-    return map.get(name) ?? null;
+    return map.get(address) ?? null;
   }
 
-  function getModelFor(name: string): string | null {
-    if (name === terminalName) return modelLabel();
+  function getModelFor(address: string): string | null {
+    if (address === myAddress()) return modelLabel();
     const map = role === "hub" ? hubTerminalModels : terminalModels;
-    return map.get(name) ?? null;
+    return map.get(address) ?? null;
   }
 
-  function getIdleSinceFor(name: string): number | null {
-    if (name === terminalName) {
+  function getIdleSinceFor(address: string): number | null {
+    if (address === myAddress()) {
       return deriveStatus().kind === "idle" ? stateSince : null;
     }
     const map = role === "hub" ? hubIdleSince : terminalIdleSince;
-    return map.get(name) ?? null;
+    return map.get(address) ?? null;
   }
 
   // ADR-0005 §1: the one compaction-decision axis. Over budget ⇔
@@ -785,20 +867,20 @@ export default function (pi: ExtensionAPI) {
 
   // ADR-0005 §2: the one blunt verdict line. Sender-side surfaces only —
   // nothing is injected into the receiver's context.
-  function budgetReminder(name: string, overrideBudget?: number): string {
-    if (name === "*") return ""; // broadcast: no readout
-    const hit = overBudget(name, overrideBudget);
+  function budgetReminder(address: string, overrideBudget?: number): string {
+    if (address === "*") return ""; // broadcast: no readout
+    const hit = overBudget(address, overrideBudget);
     if (!hit) return "";
-    return `⚠ "${name}" over budget: ${formatTokens(hit.tokens)}/${formatTokens(hit.budget)} — decide whether to link_compact (or link_new)`;
+    return `⚠ "${displayName(address)}" over budget: ${formatTokens(hit.tokens)}/${formatTokens(hit.budget)} — decide whether to link_compact (or link_new)`;
   }
 
   // ADR-0005 §5: dispatch budget and declared budget disagree → one-line
   // notice showing both values (a signal for the user, not auto-resolved).
-  function budgetMismatchNotice(name: string, dispatchBudget?: number): string {
-    if (name === "*" || dispatchBudget === undefined) return "";
-    const declared = getDeclaredBudgetFor(name);
+  function budgetMismatchNotice(address: string, dispatchBudget?: number): string {
+    if (address === "*" || dispatchBudget === undefined) return "";
+    const declared = getDeclaredBudgetFor(address);
     if (declared === null || declared === dispatchBudget) return "";
-    return `budget mismatch: dispatch ${formatTokens(dispatchBudget)} vs "${name}" declared ${formatTokens(declared)} (dispatch value used for this exchange only)`;
+    return `budget mismatch: dispatch ${formatTokens(dispatchBudget)} vs "${displayName(address)}" declared ${formatTokens(declared)} (dispatch value used for this exchange only)`;
   }
 
   // ADR-0001 decision-point readout for tool results. Full absolute form —
@@ -812,22 +894,22 @@ export default function (pi: ExtensionAPI) {
     return formatContext(c);
   }
 
-  function getStatusFor(name: string): LinkStatus | null {
-    if (name === terminalName) return deriveStatus();
+  function getStatusFor(address: string): LinkStatus | null {
+    if (address === myAddress()) return deriveStatus();
     const map = role === "hub" ? hubTerminalStatuses : terminalStatuses;
-    return map.get(name) ?? null;
+    return map.get(address) ?? null;
   }
 
-  function getCwdFor(name: string): string | null {
-    if (name === terminalName) return currentCwd || null;
-    if (role === "hub") return hubTerminalCwds.get(name) ?? null;
-    return terminalCwds.get(name) ?? null;
+  function getCwdFor(address: string): string | null {
+    if (address === myAddress()) return currentCwd || null;
+    if (role === "hub") return hubTerminalCwds.get(address) ?? null;
+    return terminalCwds.get(address) ?? null;
   }
 
-  function getContextFor(name: string): ContextSnapshot | null {
-    if (name === terminalName) return captureContext() ?? null;
-    if (role === "hub") return hubTerminalContexts.get(name) ?? null;
-    return terminalContexts.get(name) ?? null;
+  function getContextFor(address: string): ContextSnapshot | null {
+    if (address === myAddress()) return captureContext() ?? null;
+    if (role === "hub") return hubTerminalContexts.get(address) ?? null;
+    return terminalContexts.get(address) ?? null;
   }
 
   function shortenPath(cwd: string): string {
@@ -881,8 +963,9 @@ export default function (pi: ExtensionAPI) {
     for (let i = 0; i < inbox.length && batch.length < BATCH_MAX_ITEMS; i++) {
       const item = inbox[i];
       // ADR-0005 §2: reminders are sender-side only — nothing is injected
-      // into the receiver's context here.
-      const text = `From "${item.from}":\n${item.content}`;
+      // into the receiver's context here. ADR-0008 §8: same-workspace
+      // senders display shortened.
+      const text = `From "${displayName(item.from)}":\n${item.content}`;
       if (batch.length > 0 && totalChars + text.length > BATCH_MAX_CHARS) break;
       batch.push(text);
       totalChars += text.length;
@@ -959,48 +1042,42 @@ export default function (pi: ExtensionAPI) {
 
   function allTerminalNames(): Set<string> {
     const names = new Set<string>();
-    names.add(terminalName); // hub's own name
+    names.add(myAddress()); // hub's own address
     for (const name of hubClients.values()) names.add(name);
     return names;
-  }
-
-  function uniqueName(requested: string): string {
-    const existing = allTerminalNames();
-    if (!existing.has(requested)) return requested;
-    let i = 2;
-    while (existing.has(`${requested}-${i}`)) i++;
-    return `${requested}-${i}`;
   }
 
   function terminalList(): string[] {
     return Array.from(allTerminalNames()).sort();
   }
 
-  // ── ADR-0004 visible set ──────────────────────────────────────────────
+  // ── ADR-0008 reach matrix (supersedes ADR-0004's visible set) ─────────
 
-  // Visible-set rule: viewer sees target iff either is a global observer
-  // (no workspace) or both share a workspace. Symmetric. (Named canSee —
+  // Visibility = reachability, one function: same workspace ✓; either side
+  // holds the global grant ✓; regular cross-workspace ✗. (Named canSee —
   // `ws` already means WebSocket throughout this file.)
   function canSee(
-    viewerWs: string | undefined,
-    targetWs: string | undefined,
+    viewer: { ws: string; global: boolean },
+    target: { ws: string; global: boolean },
   ): boolean {
-    return !viewerWs || !targetWs || viewerWs === targetWs;
+    return viewer.ws === target.ws || viewer.global || target.global;
   }
 
-  // Hub-side workspace of any terminal (hub's own included). undefined =
-  // global observer. Callers must check existence separately — unknown names
-  // also yield undefined, so never use this alone as an existence check.
-  function hubWorkspaceOf(name: string): string | undefined {
-    return name === terminalName
-      ? (workspace ?? undefined)
-      : hubTerminalWorkspaces.get(name);
+  // Hub-side identity of any terminal (hub's own included). Unknown
+  // addresses yield ws "" — callers must check existence separately, so
+  // never use this alone as an existence check.
+  function hubIdentityOf(address: string): { ws: string; global: boolean } {
+    if (address === myAddress()) return { ws: workspace, global: globalGrant };
+    return {
+      ws: hubTerminalWorkspaces.get(address) ?? "",
+      global: hubTerminalGlobals.has(address),
+    };
   }
 
-  // Hub: sorted names visible to `viewer` (viewer included).
+  // Hub: sorted qualified addresses visible to `viewer` (viewer included).
   function hubVisibleNames(viewer: string): string[] {
-    const v = hubWorkspaceOf(viewer);
-    return terminalList().filter((n) => canSee(v, hubWorkspaceOf(n)));
+    const v = hubIdentityOf(viewer);
+    return terminalList().filter((n) => canSee(v, hubIdentityOf(n)));
   }
 
   function safeParse(data: string): LinkMessage | null {
@@ -1014,11 +1091,11 @@ export default function (pi: ExtensionAPI) {
   // ── Routing ──────────────────────────────────────────────────────────────
 
   /** Hub: broadcast a message to every terminal except `excludeName` that can
-   *  see `subject` (ADR-0004 visible set). terminal_joined/left get a
+   *  see `subject` (ADR-0008 reach matrix). terminal_joined/left get a
    *  recipient-scoped `terminals` array — no cross-group name leaks via
    *  membership lists. */
   function hubBroadcast(msg: LinkMessage, subject: string, excludeName?: string) {
-    const subjectWs = hubWorkspaceOf(subject);
+    const subjectId = hubIdentityOf(subject);
     // Membership events get per-recipient `terminals` arrays; every other
     // type serializes once (ADR-0001 §6 serialize-once-write-N preserved).
     const shared =
@@ -1027,15 +1104,15 @@ export default function (pi: ExtensionAPI) {
         : JSON.stringify(msg);
     for (const [clientWs, name] of hubClients) {
       if (name === excludeName) continue;
-      if (!canSee(hubWorkspaceOf(name), subjectWs)) continue;
+      if (!canSee(hubIdentityOf(name), subjectId)) continue;
       clientWs.send(shared ?? JSON.stringify(scopedForRecipient(msg, name)));
     }
     // Also deliver to the hub itself (unless excluded or out of the visible set)
     if (
-      excludeName !== terminalName &&
-      canSee(workspace ?? undefined, subjectWs)
+      excludeName !== myAddress() &&
+      canSee({ ws: workspace, global: globalGrant }, subjectId)
     )
-      handleIncoming(shared ? msg : scopedForRecipient(msg, terminalName));
+      handleIncoming(shared ? msg : scopedForRecipient(msg, myAddress()));
   }
 
   /** Per-recipient view of a broadcast message: membership events carry the
@@ -1047,12 +1124,82 @@ export default function (pi: ExtensionAPI) {
     return msg;
   }
 
-  /** Hub: find a client WebSocket by name. */
-  function hubClientByName(name: string): WebSocket | undefined {
+  /** Hub: find a client WebSocket by qualified address. */
+  function hubClientByName(address: string): WebSocket | undefined {
     for (const [clientWs, n] of hubClients) {
-      if (n === name) return clientWs;
+      if (n === address) return clientWs;
     }
     return undefined;
+  }
+
+  /** Hub: the one refusal for unknown AND unreachable targets — identical
+   *  text whether the target exists or not (ADR-0008 §3: confirming
+   *  existence across a wall would leak membership). Synthesizes the
+   *  matching error response for request/response pairs so the sender's
+   *  pending promise resolves immediately. Returns false (not delivered). */
+  function hubSendNotFound(
+    msg:
+      | ChatMsg
+      | PromptRequestMsg
+      | PromptResponseMsg
+      | CompactRequestMsg
+      | CompactResponseMsg
+      | BudgetSetMsg
+      | BudgetResponseMsg
+      | NewRequestMsg
+      | NewResponseMsg,
+  ): false {
+    const errText = `Terminal "${msg.to}" not found`;
+    let errorMsg: LinkMessage;
+    if (msg.type === "prompt_request") {
+      errorMsg = {
+        type: "prompt_response",
+        id: msg.id,
+        from: myAddress(),
+        to: msg.from,
+        response: "",
+        error: errText,
+      };
+    } else if (msg.type === "compact_request") {
+      errorMsg = {
+        type: "compact_response",
+        id: msg.id,
+        from: myAddress(),
+        to: msg.from,
+        ok: false,
+        reason: "not_found",
+      };
+    } else if (msg.type === "budget_set") {
+      errorMsg = {
+        type: "budget_response",
+        id: msg.id,
+        from: myAddress(),
+        to: msg.from,
+        ok: false,
+        reason: "not_found",
+      };
+    } else if (msg.type === "new_request") {
+      errorMsg = {
+        type: "new_response",
+        id: msg.id,
+        from: myAddress(),
+        to: msg.from,
+        ok: false,
+        reason: "not_found",
+      };
+    } else {
+      errorMsg = { type: "error", message: errText };
+    }
+
+    if (msg.from === myAddress()) {
+      // For request/response pairs, deliver the error response locally so
+      // the matching pending map resolves. For chat, skip — the tool
+      // result (via return false) is sufficient; no extra UI toast.
+      if (errorMsg.type !== "error") handleIncoming(errorMsg);
+    } else {
+      hubClientByName(msg.from)?.send(JSON.stringify(errorMsg));
+    }
+    return false;
   }
 
   /**
@@ -1060,6 +1207,10 @@ export default function (pi: ExtensionAPI) {
    * Returns true if the message was delivered (or sent to the hub for routing).
    * For the hub, this is authoritative. For clients, it's optimistic (hub may
    * still reject via protocol-level error responses).
+   *
+   * ADR-0008: `to` is a qualified address, "*" (broadcast per the reach
+   * matrix), or "workspace/*" (one group — the sender must be global or a
+   * member of that group).
    */
   function routeMessage(
     msg:
@@ -1074,82 +1225,50 @@ export default function (pi: ExtensionAPI) {
       | NewResponseMsg,
   ): boolean {
     if (role === "hub") {
+      const fromId = hubIdentityOf(msg.from);
       if (msg.to === "*") {
-        // ADR-0004: from scoped → own group + global observers; from a
-        // global observer → everyone.
+        // ADR-0008 §5: a regular's * reaches its own workspace plus global
+        // members; a global's * reaches everyone. hubBroadcast's per-
+        // recipient canSee(subject = sender) IS that matrix.
         hubBroadcast(msg, msg.from, msg.from);
         return true;
       }
-      // ADR-0004: cross-group direct addressing is not_found at the hub.
-      // Existence is checked before visibility — hubWorkspaceOf on an unknown
-      // name yields undefined, which canSee would read as a global observer.
-      if (msg.to === terminalName) {
-        if (canSee(hubWorkspaceOf(msg.from), workspace ?? undefined)) {
+      if (msg.to.endsWith("/*")) {
+        // One-group broadcast. A regular may target only its own group;
+        // a global may target any group. Anything else is refused with the
+        // same existence-hiding error as a direct cross-wall send.
+        const group = msg.to.slice(0, -2);
+        if (fromId.global || fromId.ws === group) {
+          const members = terminalList().filter(
+            (a) => a !== msg.from && addressWs(a) === group,
+          );
+          if (members.length > 0) {
+            const json = JSON.stringify(msg);
+            for (const addr of members) {
+              if (addr === myAddress()) handleIncoming(msg);
+              else hubClientByName(addr)?.send(json);
+            }
+            return true;
+          }
+        }
+        return hubSendNotFound(msg);
+      }
+      // Direct: existence is checked before reachability (hubIdentityOf on
+      // an unknown address yields ws "", which canSee must never read as
+      // reachable), and both failures collapse into the same refusal.
+      if (msg.to === myAddress()) {
+        if (canSee(fromId, { ws: workspace, global: globalGrant })) {
           handleIncoming(msg);
           return true;
         }
       } else {
         const targetSock = hubClientByName(msg.to);
-        if (
-          targetSock &&
-          canSee(hubWorkspaceOf(msg.from), hubWorkspaceOf(msg.to))
-        ) {
+        if (targetSock && canSee(fromId, hubIdentityOf(msg.to))) {
           targetSock.send(JSON.stringify(msg));
           return true;
         }
       }
-      // Target not found — send error back to sender
-      const errText = `Terminal "${msg.to}" not found`;
-      let errorMsg: LinkMessage;
-      if (msg.type === "prompt_request") {
-        errorMsg = {
-          type: "prompt_response",
-          id: msg.id,
-          from: terminalName,
-          to: msg.from,
-          response: "",
-          error: errText,
-        };
-      } else if (msg.type === "compact_request") {
-        errorMsg = {
-          type: "compact_response",
-          id: msg.id,
-          from: terminalName,
-          to: msg.from,
-          ok: false,
-          reason: "not_found",
-        };
-      } else if (msg.type === "budget_set") {
-        errorMsg = {
-          type: "budget_response",
-          id: msg.id,
-          from: terminalName,
-          to: msg.from,
-          ok: false,
-          reason: "not_found",
-        };
-      } else if (msg.type === "new_request") {
-        errorMsg = {
-          type: "new_response",
-          id: msg.id,
-          from: terminalName,
-          to: msg.from,
-          ok: false,
-          reason: "not_found",
-        };
-      } else {
-        errorMsg = { type: "error", message: errText };
-      }
-
-      if (msg.from === terminalName) {
-        // For request/response pairs, deliver the error response locally so
-        // the matching pending map resolves. For chat, skip — the tool
-        // result (via return false) is sufficient; no extra UI toast.
-        if (errorMsg.type !== "error") handleIncoming(errorMsg);
-      } else {
-        hubClientByName(msg.from)?.send(JSON.stringify(errorMsg));
-      }
-      return false;
+      return hubSendNotFound(msg);
     }
     if (role === "client" && ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
@@ -1157,6 +1276,7 @@ export default function (pi: ExtensionAPI) {
     }
     return false;
   }
+
 
   // ── Incoming message handler (runs on every terminal) ────────────────────
 
@@ -1177,15 +1297,16 @@ export default function (pi: ExtensionAPI) {
           ws?.close();
           break;
         }
-        // ADR-0004 fail-closed handshake: we requested a workspace but the
-        // hub's echo is missing or mismatched → the hub cannot honor
-        // isolation (e.g. an old hub). Refuse membership: disconnect, loud
-        // notify, stop auto-reconnect via the authFailed pattern. Isolation
-        // is honored or membership is refused — no warning-only mode.
-        if (workspace && msg.workspace !== workspace) {
+        // ADR-0008 fail-closed handshake, extended to both axes: the
+        // welcome's effective home / grant echoes must match what we
+        // declared — a missing or mismatched echo means the hub cannot
+        // honor the address model (e.g. a non-conforming hub). Refuse
+        // membership: disconnect, loud notify, stop auto-reconnect via the
+        // authFailed pattern. Identity is honored or membership is refused.
+        if (msg.workspace !== workspace || msg.global !== globalGrant) {
           workspaceRejected = true;
           notify(
-            `Link hub did not honor workspace "${workspace}" (echo: ${msg.workspace ? `"${msg.workspace}"` : "none"} — upgrade the hub first). Disconnecting; auto-reconnect stopped. /link-connect to retry.`,
+            `Link hub echoed a different identity (home: ${msg.workspace ? `"${msg.workspace}"` : "none"} vs "${workspace}", grant: ${String(msg.global)} vs ${globalGrant} — upgrade the hub first). Disconnecting; auto-reconnect stopped. /link-connect to retry.`,
             "error",
           );
           ws?.close();
@@ -1200,6 +1321,8 @@ export default function (pi: ExtensionAPI) {
         terminalBudgets.clear();
         terminalModels.clear();
         terminalIdleSince.clear();
+        terminalGlobals.clear();
+        for (const g of msg.globals) terminalGlobals.add(g);
         if (msg.statuses) {
           for (const [name, status] of Object.entries(msg.statuses)) {
             terminalStatuses.set(name, status);
@@ -1227,7 +1350,7 @@ export default function (pi: ExtensionAPI) {
         }
         updateStatus();
         notify(
-          `Joined link as "${terminalName}" (${connectedTerminals.length} online)${workspace ? ` · workspace "${workspace}"` : ""}`,
+          `Joined link as "${terminalName}" (${connectedTerminals.length} online) · workspace "${workspace}"${globalGrant ? " 🌐 global" : ""}`,
           "info",
         );
         pushStatus(true);
@@ -1237,16 +1360,18 @@ export default function (pi: ExtensionAPI) {
       // ── Membership updates ──
       case "terminal_joined":
         connectedTerminals = msg.terminals;
+        if (msg.global) terminalGlobals.add(msg.name);
         if (role !== "hub" && msg.cwd) terminalCwds.set(msg.name, msg.cwd);
         if (role !== "hub" && msg.context)
           terminalContexts.set(msg.name, msg.context);
         updateStatus();
-        notify(`"${msg.name}" joined the link`, "info");
+        notify(`"${displayName(msg.name)}" joined the link`, "info");
         break;
 
       case "terminal_left":
         connectedTerminals = msg.terminals;
         terminalStatuses.delete(msg.name);
+        terminalGlobals.delete(msg.name);
         if (role !== "hub") {
           terminalCwds.delete(msg.name);
           terminalContexts.delete(msg.name);
@@ -1309,7 +1434,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
         updateStatus();
-        notify(`"${msg.name}" left the link`, "info");
+        notify(`"${displayName(msg.name)}" left the link`, "info");
         break;
 
       // ── Status update from another terminal ──
@@ -1340,7 +1465,7 @@ export default function (pi: ExtensionAPI) {
               customType: "link",
               content: msg.content,
               display: true,
-              details: { from: msg.from },
+              details: { from: displayName(msg.from) },
             },
             { triggerTurn: false, deliverAs: "steer" },
           );
@@ -1353,7 +1478,7 @@ export default function (pi: ExtensionAPI) {
           routeMessage({
             type: "compact_response",
             id: msg.id,
-            from: terminalName,
+            from: myAddress(),
             to: msg.from,
             ok: false,
             reason: "busy",
@@ -1369,7 +1494,7 @@ export default function (pi: ExtensionAPI) {
           routeMessage({
             type: "compact_response",
             id,
-            from: terminalName,
+            from: myAddress(),
             to: from,
             ok,
             reason,
@@ -1404,7 +1529,7 @@ export default function (pi: ExtensionAPI) {
           routeMessage({
             type: "prompt_response",
             id: msg.id,
-            from: terminalName,
+            from: myAddress(),
             to: msg.from,
             response: "",
             error: "Terminal is busy",
@@ -1419,9 +1544,9 @@ export default function (pi: ExtensionAPI) {
             () => pushStatus(true),
             KEEPALIVE_INTERVAL_MS,
           );
-          notify(`Running remote prompt from "${msg.from}"`, "info");
+          notify(`Running remote prompt from "${displayName(msg.from)}"`, "info");
           pi.sendUserMessage(
-            `[Remote prompt from "${msg.from}"]\n\n${msg.prompt}`,
+            `[Remote prompt from "${displayName(msg.from)}"]\n\n${msg.prompt}`,
           );
         }
         break;
@@ -1432,7 +1557,7 @@ export default function (pi: ExtensionAPI) {
         if (pending) {
           if (msg.error) {
             pending.resolve(
-              textResult(`Error from "${msg.from}": ${msg.error}`, {
+              textResult(`Error from "${displayName(msg.from)}": ${msg.error}`, {
                 from: msg.from,
                 error: msg.error,
               }),
@@ -1517,12 +1642,12 @@ export default function (pi: ExtensionAPI) {
         routeMessage({
           type: "budget_response",
           id: msg.id,
-          from: terminalName,
+          from: myAddress(),
           to: msg.from,
           ok: true,
         });
         notify(
-          `"${msg.from}" set context budget to ${declaredBudget !== null ? formatTokens(declaredBudget) : "default"}`,
+          `"${displayName(msg.from)}" set context budget to ${declaredBudget !== null ? formatTokens(declaredBudget) : "default"}`,
           "info",
         );
         break;
@@ -1566,7 +1691,7 @@ export default function (pi: ExtensionAPI) {
           routeMessage({
             type: "new_response",
             id: msg.id,
-            from: terminalName,
+            from: myAddress(),
             to: msg.from,
             ok: false,
             reason: "busy",
@@ -1581,12 +1706,12 @@ export default function (pi: ExtensionAPI) {
         routeMessage({
           type: "new_response",
           id: msg.id,
-          from: terminalName,
+          from: myAddress(),
           to: msg.from,
           ok: true,
           oldSessionId,
         });
-        notify(`"${msg.from}" requested a fresh session`, "info");
+        notify(`"${displayName(msg.from)}" requested a fresh session`, "info");
         // ctx.newSession() lives on the COMMAND context only (event/tool
         // contexts lack session-control methods). Routing through a
         // registered command — sendUserMessage with expandPromptTemplates:
@@ -1644,6 +1769,12 @@ export default function (pi: ExtensionAPI) {
         // close — flag it so the close handler stops auto-reconnect.
         if (/protocol version rejected/i.test(msg.message)) {
           versionRejected = true;
+        }
+        // ADR-0008: the hub refused our register for identity reasons
+        // (name held by a different sessionId, reserved characters, or a
+        // malformed v3 register) — same latch family as authFailed.
+        if (/name taken|register rejected/i.test(msg.message)) {
+          nameTaken = true;
         }
         break;
     }
@@ -1718,12 +1849,93 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        clientName = uniqueName(msg.name);
+        // ADR-0008 §2/§8: v3 guarantees workspace/global/sessionId — a
+        // register missing any of them (or carrying reserved characters in
+        // name/workspace) is refused loudly. Defense in depth: the client
+        // already rejects reserved characters at declaration (startup).
+        const regName = normalizeName(msg.name);
+        const regWorkspace = normalizeName(msg.workspace);
+        const malformed =
+          !regName ||
+          !regWorkspace ||
+          typeof msg.sessionId !== "string" ||
+          !msg.sessionId ||
+          typeof msg.global !== "boolean";
+        const reserved =
+          (regName && hasReserved(regName)) ||
+          (regWorkspace && hasReserved(regWorkspace));
+        if (malformed || reserved) {
+          const reason = reserved
+            ? `reserved character "/" or "*" in name or workspace`
+            : `malformed v3 register (name, workspace, global, sessionId are required)`;
+          clientWs.send(
+            JSON.stringify({
+              type: "error",
+              message: `Link register rejected: ${reason}`,
+            } satisfies ErrorMsg),
+          );
+          notify(`Rejected link register (${reason})`, "error");
+          clientWs.close();
+          return;
+        }
+
+        clientName = `${regWorkspace}/${regName}`;
+        const clientWorkspace = regWorkspace!;
+        const clientGlobal = msg.global;
+
+        // ADR-0008 §6: the hub never renames — it accepts or refuses. A
+        // live (workspace, name) collision is decided by the sessionId
+        // anchor: same session → silent takeover; different session → loud
+        // refusal. The hub's own identity can never be taken over through
+        // its client port.
+        if (clientName === myAddress()) {
+          clientWs.send(
+            JSON.stringify({
+              type: "error",
+              message: `Link name taken: "${clientName}" is the hub's own identity — the hub cannot be taken over through its client port`,
+            } satisfies ErrorMsg),
+          );
+          notify(
+            `Rejected link register: "${clientName}" collides with the hub's own identity`,
+            "error",
+          );
+          clientWs.close();
+          return;
+        }
+        const holder = hubClientByName(clientName);
+        if (holder) {
+          if (hubTerminalSessionIds.get(clientName) !== msg.sessionId) {
+            clientWs.send(
+              JSON.stringify({
+                type: "error",
+                message: `Link name taken: "${clientName}" is held by a different live session — the hub never renames; pick another name (/link-name) or stop the holder`,
+              } satisfies ErrorMsg),
+            );
+            notify(
+              `Rejected link register: "${clientName}" is held by a different session`,
+              "error",
+            );
+            clientWs.close();
+            return;
+          }
+          // Takeover: same (workspace, name), same sessionId — adopt the new
+          // socket, close the old one, no terminal_left/joined churn (the
+          // fleet sees nothing; netsplit heal and resurrection ride this).
+          // Deleting the old socket from hubClients first makes its close
+          // event a no-op.
+          hubClients.delete(holder);
+          holder.close();
+          notify(
+            `"${clientName}" reclaimed its name (session ${msg.sessionId} — silent takeover)`,
+            "info",
+          );
+        }
+
         hubClients.set(clientWs, clientName);
-        // ADR-0004: record the declared workspace (absent = global observer).
-        const clientWorkspace = normalizeName(msg.workspace);
-        if (clientWorkspace)
-          hubTerminalWorkspaces.set(clientName, clientWorkspace);
+        hubTerminalWorkspaces.set(clientName, clientWorkspace);
+        if (clientGlobal) hubTerminalGlobals.add(clientName);
+        else hubTerminalGlobals.delete(clientName);
+        hubTerminalSessionIds.set(clientName, msg.sessionId);
         // ADR-0005 v2: declared budget + model (null = default/none).
         if (typeof msg.budget === "number")
           hubTerminalBudgets.set(clientName, msg.budget);
@@ -1733,66 +1945,71 @@ export default function (pi: ExtensionAPI) {
         hubIdleSince.set(clientName, Date.now());
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
         if (msg.context) hubTerminalContexts.set(clientName, msg.context);
-        // ADR-0004: the joiner's welcome snapshot is cut to its visible set.
+        // ADR-0008: the joiner's welcome snapshot is cut to its visible set.
         const visibleNames = hubVisibleNames(clientName);
         const visible = new Set(visibleNames);
-        connectedTerminals = hubVisibleNames(terminalName);
+        connectedTerminals = hubVisibleNames(myAddress());
         updateStatus();
 
         // Confirm to the new client (include status + cwd snapshots, visible
         // set only — no cross-group leaks via the welcome payload)
+        const hubAddr = myAddress();
         const statuses: Record<string, LinkStatus> = {};
-        if (visible.has(terminalName)) {
-          statuses[terminalName] = deriveStatus(); // hub's own status
+        if (visible.has(hubAddr)) {
+          statuses[hubAddr] = deriveStatus(); // hub's own status
         }
         for (const [name, status] of hubTerminalStatuses) {
           if (name !== clientName && visible.has(name)) statuses[name] = status;
         }
         const cwds: Record<string, string> = {};
-        if (visible.has(terminalName) && currentCwd) {
-          cwds[terminalName] = currentCwd; // hub's own cwd
+        if (visible.has(hubAddr) && currentCwd) {
+          cwds[hubAddr] = currentCwd; // hub's own cwd
         }
         for (const [name, cwd] of hubTerminalCwds) {
           if (name !== clientName && visible.has(name)) cwds[name] = cwd;
         }
         const contexts: Record<string, ContextSnapshot> = {};
         const hubContext = captureContext();
-        if (hubContext && visible.has(terminalName)) {
-          contexts[terminalName] = hubContext; // hub's own context
+        if (hubContext && visible.has(hubAddr)) {
+          contexts[hubAddr] = hubContext; // hub's own context
         }
         for (const [name, c] of hubTerminalContexts) {
           if (name !== clientName && visible.has(name)) contexts[name] = c;
         }
         // ADR-0005 v2 snapshots, same visible-set cut.
         const budgets: Record<string, number> = {};
-        if (declaredBudget !== null && visible.has(terminalName)) {
-          budgets[terminalName] = declaredBudget;
+        if (declaredBudget !== null && visible.has(hubAddr)) {
+          budgets[hubAddr] = declaredBudget;
         }
         for (const [name, b] of hubTerminalBudgets) {
           if (name !== clientName && visible.has(name)) budgets[name] = b;
         }
         const models: Record<string, string> = {};
         const hubModel = modelLabel();
-        if (hubModel && visible.has(terminalName)) {
-          models[terminalName] = hubModel;
+        if (hubModel && visible.has(hubAddr)) {
+          models[hubAddr] = hubModel;
         }
         for (const [name, m] of hubTerminalModels) {
           if (name !== clientName && visible.has(name)) models[name] = m;
         }
         const idleSinceRec: Record<string, number> = {};
         if (
-          visible.has(terminalName) &&
+          visible.has(hubAddr) &&
           deriveStatus().kind === "idle"
         ) {
-          idleSinceRec[terminalName] = stateSince;
+          idleSinceRec[hubAddr] = stateSince;
         }
         for (const [name, t] of hubIdleSince) {
           if (name !== clientName && visible.has(name)) idleSinceRec[name] = t;
         }
+        // ADR-0008: visible global members — the badge set.
+        const globals = visibleNames.filter((a) =>
+          a === hubAddr ? globalGrant : hubTerminalGlobals.has(a),
+        );
         clientWs.send(
           JSON.stringify({
             type: "welcome",
-            name: clientName,
+            name: regName!,
             terminals: visibleNames,
             statuses,
             cwds,
@@ -1803,24 +2020,32 @@ export default function (pi: ExtensionAPI) {
             // ADR-0005 §8: echo the protocol version — the gate the client
             // checks before anything else.
             version: LINK_PROTOCOL_VERSION,
-            // ADR-0004: echo the effective workspace — an effective-value
-            // readback (the version gate is the compatibility mechanism).
-            ...(clientWorkspace ? { workspace: clientWorkspace } : {}),
+            // ADR-0008: echo the effective home + grant — the fail-closed
+            // membership handshake extends to both axes.
+            workspace: clientWorkspace,
+            global: clientGlobal,
+            globals,
           } satisfies WelcomeMsg),
         );
 
         // Notify everyone in the joiner's visible set (include joiner's cwd +
-        // context; `terminals` is scoped per recipient inside hubBroadcast)
-        const joined: TerminalJoinedMsg = {
-          type: "terminal_joined",
-          name: clientName,
-          terminals: [],
-          cwd: msg.cwd,
-          context: msg.context,
-        };
-        hubBroadcast(joined, clientName, clientName);
+        // context; `terminals` is scoped per recipient inside hubBroadcast).
+        // A takeover skips this entirely — the swap is silent by design.
+        if (!holder) {
+          const joined: TerminalJoinedMsg = {
+            type: "terminal_joined",
+            name: clientName,
+            terminals: [],
+            global: clientGlobal,
+            cwd: msg.cwd,
+            context: msg.context,
+          };
+          hubBroadcast(joined, clientName, clientName);
+        }
         return;
       }
+
+
 
       // Ignore messages from unregistered clients
       if (!clientName) return;
@@ -1860,13 +2085,11 @@ export default function (pi: ExtensionAPI) {
           idleSince: hubIdleSince.get(clientName) ?? null,
         };
         const json = JSON.stringify(normalized);
-        // ADR-0004: fan out only to clients that can see the updater (also
+        // ADR-0008: fan out only to clients that can see the updater (also
         // trims the ADR-0001 broadcast bill).
+        const updaterId = hubIdentityOf(clientName);
         for (const [otherWs, name] of hubClients) {
-          if (
-            name !== clientName &&
-            canSee(hubWorkspaceOf(name), hubWorkspaceOf(clientName))
-          )
+          if (name !== clientName && canSee(hubIdentityOf(name), updaterId))
             otherWs.send(json);
         }
         return;
@@ -1893,7 +2116,10 @@ export default function (pi: ExtensionAPI) {
     clientWs.on("close", () => {
       if (disposed) return;
       const name = hubClients.get(clientWs);
-      if (!name) return; // already removed (e.g. via disconnect) — ignore stale event
+      // Already removed → stale event, no-op. A takeover deletes the old
+      // socket from hubClients BEFORE closing it, so the swap emits no
+      // terminal_left (ADR-0008 §6: the fleet sees nothing).
+      if (!name) return;
       hubClients.delete(clientWs);
       hubTerminalStatuses.delete(name);
       hubTerminalContexts.delete(name);
@@ -1901,7 +2127,8 @@ export default function (pi: ExtensionAPI) {
       hubTerminalBudgets.delete(name);
       hubTerminalModels.delete(name);
       hubIdleSince.delete(name);
-      connectedTerminals = hubVisibleNames(terminalName);
+      hubTerminalSessionIds.delete(name);
+      connectedTerminals = hubVisibleNames(myAddress());
       updateStatus();
       const left: TerminalLeftMsg = {
         type: "terminal_left",
@@ -1909,9 +2136,10 @@ export default function (pi: ExtensionAPI) {
         terminals: [], // scoped per recipient inside hubBroadcast
       };
       // Fan out within the departed terminal's visible set BEFORE deleting its
-      // workspace entry — the visibility check still needs it.
+      // identity entries — the reach check still needs them.
       hubBroadcast(left, name, name);
       hubTerminalWorkspaces.delete(name);
+      hubTerminalGlobals.delete(name);
     });
 
     clientWs.on("error", () => {
@@ -1966,7 +2194,7 @@ export default function (pi: ExtensionAPI) {
         if (pendingClientRename && preferredName) terminalName = preferredName;
         pendingClientRename = false;
         role = "hub";
-        connectedTerminals = [terminalName];
+        connectedTerminals = [myAddress()];
         updateStatus();
         const authSuffix = resolvedToken ? " (auth: token required)" : "";
         notify(
@@ -2049,6 +2277,8 @@ export default function (pi: ExtensionAPI) {
         // Register with preferred name if available, otherwise current name.
         // ADR-0002: include token when resolved (present = auth; absent =
         // old-hub-compatible unauthenticated). Never log the token.
+        // ADR-0008 v3: the resolved home workspace, the self-declared global
+        // grant, and the sessionId takeover anchor are guaranteed present.
         socket.send(
           JSON.stringify({
             type: "register",
@@ -2060,8 +2290,9 @@ export default function (pi: ExtensionAPI) {
             budget: declaredBudget,
             model: modelLabel(),
             ...(token ? { token } : {}),
-            // ADR-0004: declare workspace (absent = global observer).
-            ...(workspace ? { workspace } : {}),
+            workspace,
+            global: globalGrant,
+            sessionId,
           } satisfies RegisterMsg),
         );
         resolve(true);
@@ -2074,6 +2305,9 @@ export default function (pi: ExtensionAPI) {
       });
 
       socket.on("close", () => {
+        // A superseded socket (this process re-registered and the hub
+        // took the new one over) must not tear down the live connection.
+        if (ws !== socket) return;
         ws = null;
         if (disposed) return;
         if (role === "client") {
@@ -2093,6 +2327,10 @@ export default function (pi: ExtensionAPI) {
               `Link auth rejected by hub (token mismatch or missing). Auto-reconnect stopped. Check ${PROFILES_FILE_PATH}, then /link-connect.`,
               "error",
             );
+          } else if (nameTaken) {
+            // ADR-0008: the register refusal error already notified; hold
+            // the line — no auto-reconnect (the hub never renames, so a
+            // retry with the same declaration would refuse again).
           } else if (workspaceRejected || versionRejected) {
             // ADR-0004/0005: already notified loudly at the handshake (or via
             // the hub's rejection error); just hold the line — no
@@ -2132,16 +2370,32 @@ export default function (pi: ExtensionAPI) {
     // the guard (ADR-0005): a terminal the fleet refused for its version
     // must not promote itself into a version-split hub. profileUnresolved
     // joins too (ADR-0007): fail-closed means no dial AND no promotion.
+    // nameTaken joins too (ADR-0008): a terminal the hub refused for its
+    // identity must not promote itself into a parallel fleet under the
+    // contested name.
     const hubHost = resolvedHubUrl ? urlHost(resolvedHubUrl) : null;
     const nonLoopback = hubHost ? !isLoopbackHost(hubHost) : false;
-    if (!nonLoopback && !authFailed && !versionRejected && !profileUnresolved) {
+    if (
+      !nonLoopback &&
+      !authFailed &&
+      !versionRejected &&
+      !profileUnresolved &&
+      !nameTaken
+    ) {
       if (await startHub()) return;
     }
 
     // Hub not reachable and we cannot (or must not) promote. Retry after
     // delay — except on refusal latches (rejection ≠ hub loss; a config
     // refusal re-firing every 2–5s would be a self-masking storm, #7).
-    if (authFailed || versionRejected || profileUnresolved || hubConfigFailed) {
+    if (
+      authFailed ||
+      versionRejected ||
+      profileUnresolved ||
+      hubConfigFailed ||
+      nameTaken ||
+      workspaceRejected
+    ) {
       return;
     }
     scheduleReconnect();
@@ -2232,6 +2486,9 @@ export default function (pi: ExtensionAPI) {
     terminalCwds.clear();
     hubTerminalCwds.clear();
     hubTerminalWorkspaces.clear();
+    terminalGlobals.clear();
+    hubTerminalGlobals.clear();
+    hubTerminalSessionIds.clear();
     terminalBudgets.clear();
     terminalModels.clear();
     terminalIdleSince.clear();
@@ -2243,8 +2500,9 @@ export default function (pi: ExtensionAPI) {
     lastStatusSendAt = 0;
     // ADR-0002: clear resolved client/hub token on disconnect so a fresh
     // connect re-reads the profiles file (token may have been rotated).
-    // authFailed is intentionally preserved across disconnect (a rejection
-    // means the user must fix the token); only /link-connect clears it.
+    // authFailed/nameTaken are intentionally preserved across disconnect (a
+    // refusal means the user must fix the declaration); only /link-connect
+    // clears them.
     resolvedHubUrl = null;
     resolvedToken = null;
     updateStatus();
@@ -2278,6 +2536,11 @@ export default function (pi: ExtensionAPI) {
     ctx = _ctx;
     currentCwd = _ctx.cwd;
 
+    // ADR-0008: the pi session id is the identity anchor register carries
+    // (the hub's takeover decision). Random fallback if the host predates
+    // getSessionId.
+    sessionId = _ctx.sessionManager.getSessionId?.() ?? sessionId;
+
     // Resolve terminal name. Precedence:
     //   --link-name flag  >  saved link-name  >  session name  >  random
     //
@@ -2291,6 +2554,14 @@ export default function (pi: ExtensionAPI) {
       flagName = normalizeName(cliRaw);
       if (!flagName) {
         console.error("Error: --link-name requires a non-empty value.");
+        process.exit(1);
+      }
+      // ADR-0008 §2: `/` and `*` are reserved (address separator, broadcast
+      // wildcard) — rejected loudly at declaration.
+      if (hasReserved(flagName)) {
+        console.error(
+          `Error: --link-name must not contain "/" or "*" (reserved address characters), got "${flagName}".`,
+        );
         process.exit(1);
       }
     }
@@ -2314,23 +2585,44 @@ export default function (pi: ExtensionAPI) {
       const saved = latestCustomData("link-name") as
         | { name?: unknown }
         | undefined;
-      const savedName = normalizeName(
+      let savedName = normalizeName(
         typeof saved?.name === "string" ? saved.name : undefined,
       );
+      // ADR-0008: a saved name with reserved characters predates the
+      // address model — ignore it (same precedent as malformed saved names).
+      if (savedName && hasReserved(savedName)) {
+        console.error(
+          `Link: ignoring saved link-name "${savedName}" (contains reserved "/" or "*") — set a new one with --link-name.`,
+        );
+        savedName = undefined;
+      }
       if (savedName) {
         preferredName = savedName;
         terminalName = preferredName;
       } else {
         const sessionName = normalizeName(pi.getSessionName());
-        if (sessionName) terminalName = sessionName;
+        // A session name is not a link declaration — it may legitimately
+        // contain reserved characters. Fall back to the random name rather
+        // than refuse startup.
+        if (sessionName && !hasReserved(sessionName)) {
+          terminalName = sessionName;
+        } else if (sessionName) {
+          console.error(
+            `Link: session name "${sessionName}" contains reserved "/" or "*" — using a random link name (set one with --link-name).`,
+          );
+        }
       }
     }
 
-    // Resolve workspace (ADR-0004). Precedence mirrors link-name:
-    //   --link-workspace flag  >  PI_LINK_WORKSPACE env  >  saved link-workspace  >  none (global observer)
+    // Resolve home workspace (ADR-0008 §1). Precedence mirrors link-name:
+    //   --link-workspace flag  >  PI_LINK_WORKSPACE env  >  saved link-workspace  >  "default"
+    // Undeclared no longer means privileged — it means the `default`
+    // workspace, where zero-config loopback pairs still find each other.
     // Fixed at startup — no runtime command, never derived from cwd. Empty
-    // after normalize = error (flag) / ignore (env, entry). PI_LINK_WORKSPACE
-    // is consumed once and removed so spawned children don't inherit it.
+    // after normalize = error (flag) / ignore (env, entry). Reserved
+    // characters (`/`, `*`) = startup error (flag AND env, exit 1) / ignored
+    // (saved entry — predates the address model). PI_LINK_WORKSPACE is
+    // consumed once and removed so spawned children don't inherit it.
     const workspaceFlagRaw = pi.getFlag("link-workspace");
     let workspaceFlag: string | undefined;
     if (typeof workspaceFlagRaw === "string") {
@@ -2339,10 +2631,23 @@ export default function (pi: ExtensionAPI) {
         console.error("Error: --link-workspace requires a non-empty value.");
         process.exit(1);
       }
+      if (hasReserved(workspaceFlag)) {
+        console.error(
+          `Error: --link-workspace must not contain "/" or "*" (reserved address characters), got "${workspaceFlag}".`,
+        );
+        process.exit(1);
+      }
     }
     const workspaceEnvRaw = process.env.PI_LINK_WORKSPACE;
     delete process.env.PI_LINK_WORKSPACE;
-    const workspaceResolved = workspaceFlag ?? normalizeName(workspaceEnvRaw);
+    const workspaceEnv = normalizeName(workspaceEnvRaw);
+    if (workspaceEnv && hasReserved(workspaceEnv)) {
+      console.error(
+        `Error: PI_LINK_WORKSPACE must not contain "/" or "*" (reserved address characters), got "${workspaceEnv}".`,
+      );
+      process.exit(1);
+    }
+    const workspaceResolved = workspaceFlag ?? workspaceEnv;
     if (workspaceResolved) {
       workspace = workspaceResolved;
       // Skip re-append when the saved entry already matches (same growth
@@ -2359,12 +2664,46 @@ export default function (pi: ExtensionAPI) {
       const savedWorkspace = latestCustomData("link-workspace") as
         | { workspace?: unknown }
         | undefined;
+      const savedWs = normalizeName(
+        typeof savedWorkspace?.workspace === "string"
+          ? savedWorkspace.workspace
+          : undefined,
+      );
+      if (savedWs && hasReserved(savedWs)) {
+        console.error(
+          `Link: ignoring saved link-workspace "${savedWs}" (contains reserved "/" or "*") — landing in "${DEFAULT_WORKSPACE}".`,
+        );
+      }
       workspace =
-        normalizeName(
-          typeof savedWorkspace?.workspace === "string"
-            ? savedWorkspace.workspace
-            : undefined,
-        ) ?? null;
+        savedWs && !hasReserved(savedWs) ? savedWs : DEFAULT_WORKSPACE;
+    }
+
+    // Resolve the global grant (ADR-0008 §1/§7). Precedence mirrors
+    // link-name:
+    //   --link-global flag  >  PI_LINK_GLOBAL=1 env  >  saved link-global entry  >  false
+    // Self-declared within the trust domain — the token is the sole
+    // security boundary (ADR-0002); the grant is mistake-proofing and noise
+    // control, not an authorization tier. PI_LINK_GLOBAL is consumed once
+    // and removed so spawned children don't inherit it.
+    const globalFlagRaw = pi.getFlag("link-global");
+    const globalEnvRaw = process.env.PI_LINK_GLOBAL;
+    delete process.env.PI_LINK_GLOBAL;
+    const globalDeclared = globalFlagRaw === true || globalEnvRaw === "1";
+    if (globalDeclared) {
+      globalGrant = true;
+      // Skip re-append when the saved entry already matches (same growth
+      // guard as link-name).
+      const latestGlobal = latestCustomData("link-global") as
+        | { global?: unknown }
+        | undefined;
+      if (latestGlobal?.global !== true) {
+        pi.appendEntry("link-global", { global: true });
+      }
+    } else {
+      const savedGlobal = latestCustomData("link-global") as
+        | { global?: unknown }
+        | undefined;
+      globalGrant = savedGlobal?.global === true;
     }
 
     // Resolve context budget (ADR-0005 §3). Precedence mirrors link-name:
@@ -2511,7 +2850,7 @@ export default function (pi: ExtensionAPI) {
       routeMessage({
         type: "prompt_response",
         id,
-        from: terminalName,
+        from: myAddress(),
         to: from,
         response: responseText || "(no response)",
       });
@@ -2533,14 +2872,32 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Shared "target not found" result for the send/prompt/compact tools.
-  // Returns null when the target is present, so callers can `if (miss) return miss;`.
-  function targetNotFound(to: string) {
-    return connectedTerminals.includes(to)
+  // Takes a QUALIFIED address (qualifyTo first). Returns null when the
+  // target is present, so callers can `if (miss) return miss;`.
+  // Existence-hiding (ADR-0008 §3): the connected list shows only the
+  // caller's own visible set — no cross-wall membership leak.
+  function targetNotFound(address: string) {
+    return connectedTerminals.includes(address)
       ? null
       : textResult(
-          `Terminal "${to}" not found. Connected: ${connectedTerminals.join(", ")}`,
-          { to, error: "not_found" },
+          `Terminal "${displayName(address)}" not found. Connected: ${connectedTerminals.map(displayName).join(", ")}`,
+          { to: address, error: "not_found" },
         );
+  }
+
+  // ADR-0008 §4: validate a single-terminal tool `to` and return its
+  // qualified address. Broadcast forms ("*", "ws/*") are rejected — the
+  // lifecycle tools address one terminal.
+  function directTarget(to: string): { address: string } | { invalid: ReturnType<typeof textResult> } {
+    if (to === "*" || to.endsWith("/*")) {
+      return {
+        invalid: textResult(
+          `Broadcast target "${to}" is not valid here — address a single terminal (bare name or "workspace/name")`,
+          { to, error: "invalid_target" },
+        ),
+      };
+    }
+    return { address: qualifyTo(to) };
   }
 
   // Shared ✓/✗ result renderer for link_send and link_compact.
@@ -2563,13 +2920,15 @@ export default function (pi: ExtensionAPI) {
     label: "Link Send",
     description: [
       "Send a message to another Pi terminal on the link.",
-      'Use to:"*" for broadcast. triggerTurn is required: true wakes the receiver\'s LLM (use to dispatch work); false delivers passively — into the live run if the receiver is busy, or stored-but-not-processed if it is idle (use link_prompt for a guaranteed response, or resend with triggerTurn:true once it wakes).',
+      'to is an address: a bare name resolves in your own workspace only (no scope chain); cross-workspace targets are always spelled qualified — "workspace/name". Use to:"*" for broadcast (your visible set), or "workspace/*" for one group (own group; any group with the global grant).',
+      "triggerTurn is required: true wakes the receiver's LLM (use to dispatch work); false delivers passively — into the live run if the receiver is busy, or stored-but-not-processed if it is idle (use link_prompt for a guaranteed response, or resend with triggerTurn:true once it wakes).",
     ].join(" "),
     promptSnippet:
       "Send a message to another Pi terminal on the local link network",
     parameters: Type.Object({
       to: Type.String({
-        description: 'Target terminal name, or "*" for broadcast',
+        description:
+          'Target terminal address (bare name = your own workspace; "workspace/name" for cross-workspace), "*" for broadcast, or "workspace/*" for one group',
       }),
       message: Type.String({ description: "Message content" }),
       // ADR-0003: required (no default). The old default:false silently
@@ -2594,27 +2953,43 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params) {
       if (role === "disconnected") return notConnectedResult();
 
-      // Pre-validate target exists locally (best-effort, catches typos and definitely-absent names)
-      if (params.to !== "*") {
-        if (params.to === terminalName) {
+      // ADR-0008 §4/§5: bare names resolve in the sender's own workspace
+      // only; "ws/*" is a one-group broadcast — a regular may target only
+      // its own group, anything else gets the existence-hiding refusal.
+      const isBroadcast = params.to === "*";
+      const isGroup = !isBroadcast && params.to.endsWith("/*");
+      const wireTo = isBroadcast || isGroup ? params.to : qualifyTo(params.to);
+
+      if (isGroup) {
+        const group = params.to.slice(0, -2);
+        if (!globalGrant && group !== workspace) {
+          return textResult(
+            `Terminal "${params.to}" not found. Connected: ${connectedTerminals.map(displayName).join(", ")}`,
+            { to: params.to, error: "not_found" },
+          );
+        }
+      }
+      if (!isBroadcast && !isGroup) {
+        if (wireTo === myAddress()) {
           return textResult("Cannot send to yourself", {
             to: params.to,
             error: "self_target",
           });
         }
-        const miss = targetNotFound(params.to);
+        // Pre-validate target exists locally (best-effort, catches typos and definitely-absent names)
+        const miss = targetNotFound(wireTo);
         if (miss) return miss;
       }
 
       const delivered = routeMessage({
         type: "chat",
-        from: terminalName,
-        to: params.to,
+        from: myAddress(),
+        to: wireTo,
         content: params.message,
         triggerTurn: params.triggerTurn,
       });
 
-      const target = params.to === "*" ? "all terminals" : `"${params.to}"`;
+      const target = isBroadcast ? "all terminals" : `"${params.to}"`;
       if (!delivered) {
         return textResult(`Failed to send to ${target}`, {
           to: params.to,
@@ -2625,14 +3000,15 @@ export default function (pi: ExtensionAPI) {
       const verb = role === "hub" ? "Sent to" : "Sent to hub for delivery to";
       // ADR-0001/0005 decision point: context readout + blunt over-budget
       // reminder (sender-side only) + per-dispatch mismatch notice.
-      // Broadcast ("*") gets no readout; missing cache / unknown tokens omit.
-      const readout = contextReadout(params.to);
+      // Broadcast ("*" / "ws/*") gets no readout; missing cache / unknown
+      // tokens omit.
+      const readout = contextReadout(wireTo);
       // Sanitize the per-dispatch override — invalid values (negative,
       // fractional, NaN) are ignored rather than fed into the comparison.
       const sendOverride =
         params.budget !== undefined ? parseBudget(params.budget) : undefined;
-      const reminder = budgetReminder(params.to, sendOverride);
-      const mismatch = budgetMismatchNotice(params.to, sendOverride);
+      const reminder = budgetReminder(wireTo, sendOverride);
+      const mismatch = budgetMismatchNotice(wireTo, sendOverride);
       // ADR-0003: idle-target warning on a successful direct send with
       // triggerTurn:false. A passive send to an idle receiver is stored but
       // not processed (steer lands in the session without waking the LLM);
@@ -2640,10 +3016,10 @@ export default function (pi: ExtensionAPI) {
       // or unknown status → no warning (steer into a live run is fine).
       // Broadcast excluded — passive FYI is its designed semantics.
       let idleWarning = "";
-      if (params.to !== "*" && !params.triggerTurn) {
-        const st = getStatusFor(params.to);
+      if (!isBroadcast && !isGroup && !params.triggerTurn) {
+        const st = getStatusFor(wireTo);
         if (st?.kind === "idle") {
-          idleWarning = ` ⚠ "${params.to}" is idle — message stored, not processed; resend with triggerTurn:true or use link_prompt`;
+          idleWarning = ` ⚠ "${displayName(wireTo)}" is idle — message stored, not processed; resend with triggerTurn:true or use link_prompt`;
         }
       }
       const suffix = [readout, reminder, mismatch, idleWarning]
@@ -2682,7 +3058,10 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     promptSnippet: "Ask another Pi terminal to compact its context window",
     parameters: Type.Object({
-      to: Type.String({ description: "Target terminal name" }),
+      to: Type.String({
+        description:
+          'Target terminal address: a bare name resolves in your own workspace only; spell cross-workspace targets qualified — "workspace/name"',
+      }),
       instructions: Type.Optional(
         Type.String({
           description: "Optional custom compaction instructions for the target",
@@ -2700,7 +3079,13 @@ export default function (pi: ExtensionAPI) {
 
       if (role === "disconnected") return notConnectedResult();
 
-      if (params.to === terminalName) {
+      // ADR-0008 §4: bare name → own workspace; qualified passes through;
+      // broadcast forms are invalid for the lifecycle tools.
+      const compactTarget = directTarget(params.to);
+      if ("invalid" in compactTarget) return compactTarget.invalid;
+      params.to = compactTarget.address;
+
+      if (params.to === myAddress()) {
         return textResult("Cannot compact yourself - use /compact.", {
           to: params.to,
           error: "self_target",
@@ -2759,7 +3144,7 @@ export default function (pi: ExtensionAPI) {
         const delivered = routeMessage({
           type: "compact_request",
           id: requestId,
-          from: terminalName,
+          from: myAddress(),
           to: params.to,
           instructions: params.instructions,
         });
@@ -2803,7 +3188,10 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     promptSnippet: "Set a terminal's declared context budget on the link",
     parameters: Type.Object({
-      to: Type.String({ description: "Target terminal name" }),
+      to: Type.String({
+        description:
+          'Target terminal address: a bare name resolves in your own workspace only; spell cross-workspace targets qualified — "workspace/name"',
+      }),
       budget: Type.Union([Type.Number(), Type.Literal("off")], {
         description:
           'Absolute used-tokens ceiling (e.g. 56000), or "off" to clear back to the default',
@@ -2828,12 +3216,17 @@ export default function (pi: ExtensionAPI) {
       }
       const what = next != null ? formatTokens(next) : "default";
 
+      // ADR-0008 §4: bare name → own workspace; qualified passes through.
+      const budgetTarget = directTarget(params.to);
+      if ("invalid" in budgetTarget) return budgetTarget.invalid;
+      params.to = budgetTarget.address;
+
       // Self-targeting allowed — apply locally, no routing.
-      if (params.to === terminalName) {
+      if (params.to === myAddress()) {
         declaredBudget = next ?? null;
         pi.appendEntry("link-budget", { budget: declaredBudget });
         pushStatus(true);
-        return textResult(`Budget on "${terminalName}" set to ${what}`, {
+        return textResult(`Budget on "${displayName(params.to)}" set to ${what}`, {
           to: params.to,
         });
       }
@@ -2885,7 +3278,7 @@ export default function (pi: ExtensionAPI) {
         const delivered = routeMessage({
           type: "budget_set",
           id: requestId,
-          from: terminalName,
+          from: myAddress(),
           to: params.to,
           budget: next ?? null,
         });
@@ -2929,7 +3322,10 @@ export default function (pi: ExtensionAPI) {
     ].join(" "),
     promptSnippet: "Ask another Pi terminal to start a fresh session",
     parameters: Type.Object({
-      to: Type.String({ description: "Target terminal name" }),
+      to: Type.String({
+        description:
+          'Target terminal address: a bare name resolves in your own workspace only; spell cross-workspace targets qualified — "workspace/name"',
+      }),
     }),
 
     async execute(_toolCallId, params, signal) {
@@ -2941,7 +3337,11 @@ export default function (pi: ExtensionAPI) {
       }
       if (role === "disconnected") return notConnectedResult();
 
-      if (params.to === terminalName) {
+      const newTarget = directTarget(params.to);
+      if ("invalid" in newTarget) return newTarget.invalid;
+      params.to = newTarget.address;
+
+      if (params.to === myAddress()) {
         return textResult("Cannot start a fresh session on yourself - use /new.", {
           to: params.to,
           error: "self_target",
@@ -2998,7 +3398,7 @@ export default function (pi: ExtensionAPI) {
         const delivered = routeMessage({
           type: "new_request",
           id: requestId,
-          from: terminalName,
+          from: myAddress(),
           to: params.to,
         });
         if (!delivered) {
@@ -3037,7 +3437,10 @@ export default function (pi: ExtensionAPI) {
     promptSnippet:
       "Send a prompt to another Pi terminal and receive its LLM response",
     parameters: Type.Object({
-      to: Type.String({ description: "Target terminal name" }),
+      to: Type.String({
+        description:
+          'Target terminal address: a bare name resolves in your own workspace only; spell cross-workspace targets qualified — "workspace/name"',
+      }),
       prompt: Type.String({ description: "Prompt to send" }),
       // ADR-0005 §5: optional per-dispatch budget override (tokens) — this
       // exchange's checks only, never mutates the target's declared budget.
@@ -3059,7 +3462,11 @@ export default function (pi: ExtensionAPI) {
 
       if (role === "disconnected") return notConnectedResult();
 
-      if (params.to === terminalName) {
+      const promptTarget = directTarget(params.to);
+      if ("invalid" in promptTarget) return promptTarget.invalid;
+      params.to = promptTarget.address;
+
+      if (params.to === myAddress()) {
         return textResult("Cannot prompt yourself", {
           to: params.to,
           error: "self_target",
@@ -3127,7 +3534,7 @@ export default function (pi: ExtensionAPI) {
         const delivered = routeMessage({
           type: "prompt_request",
           id: requestId,
-          from: terminalName,
+          from: myAddress(),
           to: params.to,
           prompt: params.prompt,
         });
@@ -3193,37 +3600,51 @@ export default function (pi: ExtensionAPI) {
       const contexts: Record<string, ContextSnapshot> = {};
       const models: Record<string, string> = {};
       const overBudgetNames: string[] = [];
-      const list = connectedTerminals
-        .map((name) => {
-          const status = getStatusFor(name);
-          let statusStr = status ? formatStatus(status) : "";
-          if (status?.kind === "idle") {
-            const idle = getIdleSinceFor(name);
-            if (idle) statusStr = `idle (${formatDuration(idle)})`;
-          }
-          if (statusStr) statuses[name] = statusStr;
-          const cwd = getCwdFor(name);
-          if (cwd) cwds[name] = cwd;
-          const context = getContextFor(name);
-          if (context) contexts[name] = context;
-          const model = getModelFor(name);
-          if (model) models[name] = model;
-          const over = overBudget(name) !== null;
-          if (over) overBudgetNames.push(name);
-          let line = terminalLine(name, "  \u2022");
-          if (cwd) line += `\n    cwd: ${cwd}`;
-          return line;
-        })
-        .join("\n");
+      // ADR-0008 §8: group by workspace (own home first), badge global
+      // members, shorten same-workspace addresses — the wire stays
+      // qualified, the display groups.
+      const groupNames = [...new Set(connectedTerminals.map(addressWs))].sort(
+        (a, b) =>
+          a === workspace ? -1 : b === workspace ? 1 : a.localeCompare(b),
+      );
+      const sections: string[] = [];
+      for (const group of groupNames) {
+        const members = connectedTerminals
+          .filter((a) => addressWs(a) === group)
+          .map((name) => {
+            const status = getStatusFor(name);
+            let statusStr = status ? formatStatus(status) : "";
+            if (status?.kind === "idle") {
+              const idle = getIdleSinceFor(name);
+              if (idle) statusStr = `idle (${formatDuration(idle)})`;
+            }
+            if (statusStr) statuses[name] = statusStr;
+            const cwd = getCwdFor(name);
+            if (cwd) cwds[name] = cwd;
+            const context = getContextFor(name);
+            if (context) contexts[name] = context;
+            const model = getModelFor(name);
+            if (model) models[name] = model;
+            const over = overBudget(name) !== null;
+            if (over) overBudgetNames.push(name);
+            let line = terminalLine(name, "  \u2022");
+            if (cwd) line += `\n    cwd: ${cwd}`;
+            return line;
+          })
+          .join("\n");
+        sections.push(`${group === workspace ? `${group} (home)` : group}\n${members}`);
+      }
 
-      return textResult(`Connected terminals:\n${list}`, {
+      return textResult(`Connected terminals:\n${sections.join("\n")}`, {
         terminals: connectedTerminals,
+        globals: connectedTerminals.filter(isGlobalAddr),
         statuses,
         cwds,
         contexts,
         models,
         overBudget: overBudgetNames,
-        self: terminalName,
+        self: myAddress(),
+        workspace,
         role,
       });
     },
@@ -3232,12 +3653,14 @@ export default function (pi: ExtensionAPI) {
       const details = result.details as
         | {
             terminals?: string[];
+            globals?: string[];
             statuses?: Record<string, string>;
             cwds?: Record<string, string>;
             contexts?: Record<string, ContextSnapshot>;
             models?: Record<string, string>;
             overBudget?: string[];
             self?: string;
+            workspace?: string;
             role?: string;
           }
         | undefined;
@@ -3246,25 +3669,45 @@ export default function (pi: ExtensionAPI) {
         return new Text(txt?.type === "text" ? txt.text : "", 0, 0);
       }
 
+      const home = details.workspace ?? "";
+      const short = (addr: string) => {
+        const i = addr.indexOf("/");
+        return i > 0 && addr.slice(0, i) === home ? addr.slice(i + 1) : addr;
+      };
+      const globalSet = new Set(details.globals ?? []);
+      const groups = [...new Set(details.terminals.map((a) => a.slice(0, a.indexOf("/"))))].sort(
+        (a, b) => (a === home ? -1 : b === home ? 1 : a.localeCompare(b)),
+      );
+
       let text = theme.fg("toolTitle", theme.bold("link "));
       text += theme.fg("muted", `(${details.role}) `);
       text += theme.fg("accent", `${details.terminals.length} terminal(s)`);
       const overSet = new Set(details.overBudget ?? []);
-      for (const name of details.terminals) {
-        const isSelf = name === details.self;
-        const status = details.statuses?.[name] ?? "";
-        const cwd = details.cwds?.[name];
-        const ctxStr = formatContext(details.contexts?.[name]);
-        const model = details.models?.[name];
-        const nameStr = isSelf ? `\u2022 ${name} (you)` : `\u2022 ${name}`;
+      for (const group of groups) {
         text +=
-          "\n  " +
-          (isSelf ? theme.fg("accent", nameStr) : theme.fg("text", nameStr)) +
-          (status ? "  " + theme.fg("dim", status) : "") +
-          (ctxStr ? theme.fg("dim", "  \u00b7 " + ctxStr) : "");
-        if (overSet.has(name)) text += theme.fg("warning", " ⚠ over budget");
-        if (model) text += theme.fg("dim", "  \u00b7 " + model);
-        if (cwd) text += "\n    " + theme.fg("dim", `cwd: ${shortenPath(cwd)}`);
+          "\n" +
+          theme.fg("toolTitle", group) +
+          (group === home ? theme.fg("dim", " (home)") : "");
+        for (const name of details.terminals.filter(
+          (a) => a.slice(0, a.indexOf("/")) === group,
+        )) {
+          const isSelf = name === details.self;
+          const status = details.statuses?.[name] ?? "";
+          const cwd = details.cwds?.[name];
+          const ctxStr = formatContext(details.contexts?.[name]);
+          const model = details.models?.[name];
+          let nameStr = `\u2022 ${short(name)}`;
+          if (globalSet.has(name)) nameStr += " \ud83c\udf10";
+          if (isSelf) nameStr += " (you)";
+          text +=
+            "\n  " +
+            (isSelf ? theme.fg("accent", nameStr) : theme.fg("text", nameStr)) +
+            (status ? "  " + theme.fg("dim", status) : "") +
+            (ctxStr ? theme.fg("dim", "  \u00b7 " + ctxStr) : "");
+          if (overSet.has(name)) text += theme.fg("warning", " ⚠ over budget");
+          if (model) text += theme.fg("dim", "  \u00b7 " + model);
+          if (cwd) text += "\n    " + theme.fg("dim", `cwd: ${shortenPath(cwd)}`);
+        }
       }
       return new Text(text, 0, 0);
     },
@@ -3273,19 +3716,21 @@ export default function (pi: ExtensionAPI) {
   // Shared one-line terminal summary for link_list and /link. ADR-0005:
   // idle duration prefers the hub-authoritative idle-since clock; the
   // over-budget marker is the link_list reminder surface (§2); the model
-  // label shows raw (display may shorten) (§6).
-  function terminalLine(name: string, bullet = "\u2022"): string {
-    const status = getStatusFor(name);
+  // label shows raw (display may shorten) (§6). ADR-0008 §8: same-workspace
+  // addresses shorten to the bare name; global members get the 🌐 badge.
+  function terminalLine(address: string, bullet = "\u2022"): string {
+    const status = getStatusFor(address);
     let statusStr = status ? formatStatus(status) : "";
     if (status?.kind === "idle") {
-      const idle = getIdleSinceFor(name);
+      const idle = getIdleSinceFor(address);
       if (idle) statusStr = `idle (${formatDuration(idle)})`;
     }
-    const ctxStr = formatContext(getContextFor(name));
-    const over = overBudget(name) !== null;
-    const model = getModelFor(name);
-    const marker = name === terminalName ? " (you)" : "";
-    let line = `${bullet} ${name}${marker}${statusStr ? "  " + statusStr : ""}`;
+    const ctxStr = formatContext(getContextFor(address));
+    const over = overBudget(address) !== null;
+    const model = getModelFor(address);
+    const badge = isGlobalAddr(address) ? " \ud83c\udf10" : "";
+    const marker = address === myAddress() ? " (you)" : "";
+    let line = `${bullet} ${displayName(address)}${badge}${marker}${statusStr ? "  " + statusStr : ""}`;
     if (ctxStr) line += `  \u00b7 ${ctxStr}`;
     if (over) line += " ⚠ over budget";
     if (model) line += `  \u00b7 ${model}`;
@@ -3337,6 +3782,16 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // ADR-0008 §2: `/` and `*` are reserved — rejected loudly at
+      // declaration (here: the rename command).
+      if (hasReserved(newName)) {
+        _ctx.ui.notify(
+          `Name "${newName}" contains a reserved character ("/" or "*") — pick another`,
+          "warning",
+        );
+        return;
+      }
+
       function savePreference() {
         preferredName = newName;
         pi.appendEntry("link-name", { name: preferredName });
@@ -3350,49 +3805,53 @@ export default function (pi: ExtensionAPI) {
 
       // If we're the hub, check uniqueness before persisting
       if (role === "hub") {
-        // Check if name is taken by another terminal
-        const takenByOther = Array.from(hubClients.values()).includes(newName);
+        // ADR-0008: names are unique per workspace — the check is against
+        // the new qualified address.
+        const newAddr = `${workspace}/${newName}`;
+        const takenByOther = Array.from(hubClients.values()).includes(newAddr);
         if (takenByOther) {
           _ctx.ui.notify(
-            `Name "${newName}" is already taken by another terminal`,
+            `Name "${newName}" is already taken in workspace "${workspace}"`,
             "warning",
           );
           return;
         }
-        const old = terminalName;
+        const oldAddr = myAddress();
         terminalName = newName;
-        connectedTerminals = hubVisibleNames(terminalName);
+        connectedTerminals = hubVisibleNames(myAddress());
         updateStatus();
-        // Notify clients only — hub already updated local state. ADR-0004:
+        // Notify clients only — hub already updated local state. ADR-0008:
         // the rebroadcast stays within the renamed terminal's visible set
-        // (subject = the hub's own name; its workspace is unchanged by a rename).
+        // (subject = the hub's own address; its workspace is unchanged by a rename).
         hubBroadcast(
-          { type: "terminal_left", name: old, terminals: [] },
-          terminalName,
-          terminalName,
+          { type: "terminal_left", name: oldAddr, terminals: [] },
+          myAddress(),
+          myAddress(),
         );
         hubBroadcast(
           {
             type: "terminal_joined",
-            name: newName,
+            name: myAddress(),
             terminals: [],
+            global: globalGrant,
             cwd: currentCwd,
             context: captureContext(),
           },
-          terminalName,
-          terminalName,
+          myAddress(),
+          myAddress(),
         );
         pushStatus(true);
         savePreference();
         _ctx.ui.notify(`Renamed to "${newName}"`, "info");
       } else if (role === "client") {
-        // Don't update terminalName here — welcome will assign authoritatively
-        // after reconnect. Hub may dedupe newName to newName-2 if taken.
+        // Don't update terminalName here — welcome will confirm
+        // authoritatively after reconnect. ADR-0008: the hub never renames —
+        // a taken name is a loud refusal (nameTaken latch), not a suffix.
         savePreference();
         pendingClientRename = true;
         ws?.close();
         _ctx.ui.notify(
-          `Reconnecting, requesting "${newName}" (hub may assign a different name if taken)...`,
+          `Reconnecting, requesting "${newName}" (the hub refuses if the name is taken — /link-connect to retry after picking another)...`,
           "info",
         );
       } else {
@@ -3417,7 +3876,7 @@ export default function (pi: ExtensionAPI) {
       }
       routeMessage({
         type: "chat",
-        from: terminalName,
+        from: myAddress(),
         to: "*",
         content: message,
         triggerTurn: false,
@@ -3466,15 +3925,17 @@ export default function (pi: ExtensionAPI) {
       newNowExpected = false;
       const carryName = preferredName ?? terminalName;
       const carryWorkspace = workspace;
+      const carryGlobal = globalGrant;
       const carryBudget = declaredBudget;
       try {
         const { cancelled } = await cmdCtx.newSession({
           setup: async (sm) => {
             sm.appendCustomEntry("link-name", { name: carryName });
-            if (carryWorkspace)
-              sm.appendCustomEntry("link-workspace", {
-                workspace: carryWorkspace,
-              });
+            sm.appendCustomEntry("link-workspace", {
+              workspace: carryWorkspace,
+            });
+            if (carryGlobal)
+              sm.appendCustomEntry("link-global", { global: true });
             if (carryBudget !== null)
               sm.appendCustomEntry("link-budget", { budget: carryBudget });
             sm.appendCustomEntry("link-active", { active: true });
@@ -3514,6 +3975,9 @@ export default function (pi: ExtensionAPI) {
       workspaceRejected = false;
       // ADR-0005: same reset for a refused protocol version.
       versionRejected = false;
+      // ADR-0008: same reset for a refused register (name held by a
+      // different session, reserved characters, malformed register).
+      nameTaken = false;
       // ADR-0007/#7: same reset for an unresolved profile or a refused hub
       // bind (likely after fixing the profiles file or PI_LINK_HOST).
       profileUnresolved = false;
