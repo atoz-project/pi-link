@@ -29,7 +29,7 @@ process.env.PI_LINK_PROFILES_FILE = PROFILES_FILE;
 const { default: createLink } = await import("../index.ts");
 
 const PORT = 19903;
-const VERSION = 2; // LINK_PROTOCOL_VERSION in index.ts
+const VERSION = 3; // LINK_PROTOCOL_VERSION in index.ts
 let failures = 0;
 
 function assert(cond, label) {
@@ -95,7 +95,7 @@ async function waitFor(pred, label, timeoutMs = 10_000) {
   throw new Error(`timeout waiting for: ${label}`);
 }
 
-// Fake hub: records registers, answers a well-formed v2 welcome.
+// Fake hub: records registers, answers a well-formed v3 welcome.
 function fakeHub(port) {
   const registers = [];
   const server = new WebSocketServer({ port, host: "127.0.0.1" });
@@ -108,12 +108,14 @@ function fakeHub(port) {
         JSON.stringify({
           type: "welcome",
           name: msg.name,
-          terminals: [msg.name],
+          terminals: [`${msg.workspace}/${msg.name}`],
           version: VERSION,
           budgets: {},
           models: {},
           idleSince: {},
-          ...(msg.workspace ? { workspace: msg.workspace } : {}),
+          workspace: msg.workspace,
+          global: msg.global,
+          globals: [],
         }),
       );
     });
@@ -132,7 +134,14 @@ function rawClient(register, port = PORT) {
     });
     ws.on("open", () =>
       ws.send(
-        JSON.stringify({ type: "register", version: VERSION, ...register }),
+        JSON.stringify({
+          type: "register",
+          version: VERSION,
+          workspace: "default",
+          global: false,
+          sessionId: `raw-${Math.random().toString(36).slice(2, 10)}`,
+          ...register,
+        }),
       ),
     );
     ws.on("error", reject);

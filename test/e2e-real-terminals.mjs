@@ -1,6 +1,6 @@
-// ADR-0004 workspace isolation — end-to-end test with REAL pi processes.
+// ADR-0008 qualified addresses — end-to-end test with REAL pi processes.
 // Spawns three actual `pi` binaries (rpc mode, stdin held open, no LLM calls)
-// loading the repo's index.ts: a global-observer hub plus one terminal each
+// loading the repo's index.ts: a global-grant hub plus one terminal each
 // in workspaces alpha and beta. Then probes the live link with raw WebSocket
 // clients and asserts cross-group invisibility on the wire.
 //
@@ -29,7 +29,7 @@ const check = (cond, label) => {
 // ── Real pi terminals ───────────────────────────────────────────────────────
 
 const children = [];
-function startPi(name, workspace) {
+function startPi(name, workspace, globalGrant) {
   const args = [
     "--mode", "rpc",
     "--no-session",
@@ -38,6 +38,7 @@ function startPi(name, workspace) {
     "--link-name", name,
   ];
   if (workspace) args.push("--link-workspace", workspace);
+  if (globalGrant) args.push("--link-global");
   // Held open on stdin: rpc mode idles until a prompt arrives (none comes).
   // HOME isolation makes the run hermetic: no global pi-link install
   // (~/.pi/agent settings — duplicate tools/flags conflict), no profiles
@@ -89,7 +90,14 @@ function probe(register, timeoutMs = 5000) {
     });
     ws.on("open", () =>
       ws.send(
-        JSON.stringify({ type: "register", version: 2, ...register }),
+        JSON.stringify({
+          type: "register",
+          version: 3,
+          workspace: "default",
+          global: false,
+          sessionId: `probe-${Math.random().toString(36).slice(2, 10)}`,
+          ...register,
+        }),
       ),
     );
     ws.on("error", (e) => {
@@ -118,7 +126,7 @@ async function waitForHub(timeoutMs = 60_000) {
 // ── Run ─────────────────────────────────────────────────────────────────────
 
 console.log("e2e: 3 real pi terminals (hub global, a@alpha, b@beta)");
-startPi("e2e-hub", null);
+startPi("e2e-hub", "default", true); // global grant, home "default"
 const ready = await waitForHub();
 check(Array.isArray(ready.terminals), "real pi hub is up and speaking the protocol");
 
@@ -129,32 +137,32 @@ startPi("e2e-beta", "beta");
 let glob;
 for (let i = 0; i < 40; i++) {
   await delay(500);
-  glob = await probe({ name: "probe-g" });
-  if (glob.terminals.includes("e2e-a") && glob.terminals.includes("e2e-beta"))
+  glob = await probe({ name: "probe-g", workspace: "ops", global: true });
+  if (glob.terminals.includes("alpha/e2e-a") && glob.terminals.includes("beta/e2e-beta"))
     break;
 }
 check(
-  glob.terminals.includes("e2e-hub") &&
-    glob.terminals.includes("e2e-a") &&
-    glob.terminals.includes("e2e-beta"),
-  `global observer sees all real terminals (${glob.terminals})`,
+  glob.terminals.includes("default/e2e-hub") &&
+    glob.terminals.includes("alpha/e2e-a") &&
+    glob.terminals.includes("beta/e2e-beta"),
+  `global member sees all real terminals, qualified (${glob.terminals})`,
 );
 
 const beta = await probe({ name: "probe-b", workspace: "beta" });
-check(beta.workspace === "beta", "beta probe welcome echoes workspace");
+check(beta.workspace === "beta", "beta probe welcome echoes effective home");
 check(
-  beta.terminals.includes("e2e-hub") && beta.terminals.includes("e2e-beta"),
-  `beta sees hub + beta member (${beta.terminals})`,
+  beta.terminals.includes("default/e2e-hub") && beta.terminals.includes("beta/e2e-beta"),
+  `beta sees global hub + beta member (${beta.terminals})`,
 );
 check(
-  !beta.terminals.includes("e2e-a"),
+  !beta.terminals.includes("alpha/e2e-a"),
   "beta does NOT see the alpha terminal (real --link-workspace flag took effect)",
 );
 
 const alpha = await probe({ name: "probe-a", workspace: "alpha" });
 check(
-  alpha.terminals.includes("e2e-a") && !alpha.terminals.includes("e2e-beta"),
-  "alpha sees only alpha + global observers",
+  alpha.terminals.includes("alpha/e2e-a") && !alpha.terminals.includes("beta/e2e-beta"),
+  "alpha sees only alpha + global members",
 );
 
 killAll();

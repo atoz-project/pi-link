@@ -247,7 +247,7 @@ By default the hub binds `127.0.0.1:9900` (loopback, unauthenticated). To span m
 
 **The profile is the dial target (ADR-0007).** A profile is a complete fleet membership declaration: *where to dial* (`url`; omitted = `ws://127.0.0.1:$PI_LINK_PORT`) and *what ticket to carry* (`token`). One resolved profile answers both. Selection: `--link-profile` flag > `PI_LINK_PROFILE` > `default` > none. Flag and env select a profile *name*; they never carry a URL (`PI_LINK_URL` is retired — ambient naked-URL dialing is how fleets silently split). The flag tier exists because `PI_LINK_PROFILE` inherits through tmux spawn chains and can silently redirect a terminal to a valid but unintended profile — explicit launch commands should say the name out loud. `none` (no profiles file / no `default`) is loopback, unauthenticated — byte-identical zero-config behavior, opt-in, upstream-friendly.
 
-**Unknown profile fails closed.** A selected name that does not resolve (a `--link-profile`/`PI_LINK_PROFILE` typo, a dangling `default`) is a loud refusal: no dial, no promotion, no auto-reconnect. Fix the config, then `/link-connect` (same latch family as auth/workspace/version rejection).
+**Unknown profile fails closed.** A selected name that does not resolve (a `--link-profile`/`PI_LINK_PROFILE` typo, a dangling `default`) is a loud refusal: no dial, no promotion, no auto-reconnect. Fix the config, then `/link-connect` (same latch family as auth/identity/version rejection).
 
 **Hub machine setup.** `default` answers "where is my fleet?" — on the machine that hosts the hub, the answer is *here*: point `default` at a loopback profile carrying the fleet token (`url` omitted). Its terminals dial loopback; the first one promotes and binds per `PI_LINK_HOST` (bind stays env — a deployment fact of one process, not a membership fact of the machine). Member machines point their `default` at the public URL. A hub machine whose `default` dialed its own public address could never self-bootstrap after an outage — non-loopback never promotes.
 
@@ -271,23 +271,22 @@ With cloudflared: publish the local `9900` port through a named tunnel and point
 
 **Mixed-version rule.** `register` carries an optional `token` field (old hubs ignore unknown fields). Upgrade all terminals before enabling auth so a mix of old (unauthenticated) and new (token-expected) hubs doesn't fragment the fleet.
 
-### Workspaces (ADR-0004)
+### Workspaces & addresses (ADR-0008)
 
-A workspace is an opt-in **visibility group** (hygiene, not security — the trust domain is unchanged: one link, one hub, one token). Terminals that declare the same workspace see each other; terminals in different workspaces are mutually invisible; terminals without a workspace are **global observers** that see everyone and are seen by everyone (this is exactly the pre-workspace behavior, so a no-workspace fleet is unchanged except one echo field in `welcome`).
+Every terminal has two independent identity axes, both fixed at startup, both riding the session file (and pre-written by `link_new`):
 
-**Declaring a workspace** (fixed at startup; changing it = restart the terminal):
+- **Home workspace** — where the terminal lives: its name's uniqueness scope and the first half of its address. `pi --link-workspace <name>` > `PI_LINK_WORKSPACE` env (consumed once) > saved `link-workspace` session entry > **`default`**. Undeclared no longer means privileged — it means the `default` workspace, where zero-config loopback pairs still find each other. Never derived from the cwd.
+- **Global grant** — how far the terminal sees and reaches: `pi --link-global` > `PI_LINK_GLOBAL=1` env (consumed once) > saved `link-global` session entry > false. Self-declared within the trust domain — the token remains the only security boundary (ADR-0002); the grant is mistake-proofing and noise control, not an authorization tier.
 
-| Precedence | Source |
-| 1 (highest) | `pi --link-workspace <name>` |
-| 2 | `PI_LINK_WORKSPACE` env (consumed once, not inherited by children) |
-| 3 | saved `link-workspace` session entry (restored on resume) |
-| 4 | none — global observer |
+**Address = `workspace/name`.** Names are unique per workspace, and on the wire every `from`/`to` is fully qualified — no ambiguity, ever. In tool calls a bare name resolves in *your own* workspace only (no scope chain); cross-workspace targets are always spelled qualified — five extra characters beat one ambiguity. `/` and `*` are reserved characters, rejected loudly at declaration (startup error, exit 1) and at register.
 
-Names are normalized like link names. The workspace is never derived from the cwd — worktrees and monorepos would fragment groups.
+**The reach matrix** (visibility = reachability, one rule): same workspace ✓; anyone → a global member ✓; a global member → anyone ✓; regular cross-workspace ✗ — refused with an existence-hiding `not_found` (identical text whether the target exists or not; confirming existence across the wall would leak membership). The matrix cuts every surface: `link_list` (grouped by workspace, global members badged 🌐, same-workspace addresses shortened), the welcome snapshot, `terminal_joined`/`terminal_left`, broadcasts, status fan-out, and direct addressing.
 
-**The visible set is the universe.** For a scoped terminal it is *same-workspace members ∪ global observers*, and it cuts every surface: `link_list`, the welcome snapshot, `terminal_joined`/`terminal_left` (including their membership lists), broadcasts, status fan-out, and direct addressing — cross-workspace `link_send`/`link_prompt`/`link_compact` returns `not_found`, exactly as if the target didn't exist. Link names stay globally unique across all workspaces (a cross-group collision still dedupes to `name-2`).
+**Broadcast follows the matrix.** A regular's `*` reaches its own workspace plus global members; a global's `*` reaches everyone; `workspace/*` targets one group (a regular may target only its own group — a foreign group is refused like any cross-workspace send).
 
-**Fail-closed handshake.** `register` carries the workspace and `welcome` echoes the effective one. A scoped terminal that gets a missing or mismatched echo (i.e., an old hub that can't honor isolation) disconnects loudly and **stops auto-reconnect** — isolation is honored or membership is refused, there is no degraded mode. **Upgrade the hub first**, then `/link-connect` on the scoped terminals.
+**The hub never renames — it accepts or refuses.** `register` carries the terminal's pi `sessionId` as identity anchor. Claiming a live `(workspace, name)`: same sessionId → **silent takeover** (the hub adopts the new socket and closes the old one, no left/joined churn — netsplit heal and resurrection both ride this); different sessionId → loud refusal and a `nameTaken` latch (no reconnect storm; pick another name with `/link-name`, then `/link-connect`). Concurrent clones must self-name distinctly at the source — disambiguation belongs to the joiner. A joiner colliding with the hub's own identity is always refused — the hub cannot be taken over through its client port.
+
+**Fail-closed handshake, both axes.** `register` carries home workspace + grant + sessionId; `welcome` echoes the effective home and grant. A missing or mismatched echo (a non-conforming hub) refuses membership loudly and **stops auto-reconnect** — identity is honored or membership is refused. **Upgrade the hub first** (protocol v3; the fleet upgrades together), then `/link-connect`.
 
 **Hub and promotion.** The hub routes for all workspaces regardless of its own membership; promotion ignores workspace — any survivor can promote and correctly serves every group after clients re-register.
 
@@ -328,7 +327,7 @@ Send a fire-and-forget chat message to a specific terminal or broadcast to all.
 
 | Parameter     | Type      | Description                                          |
 | ------------- | --------- | ---------------------------------------------------- |
-| `to`          | `string`  | Target terminal name, or `"*"` for broadcast         |
+| `to`          | `string`  | Target terminal address: bare name (your own workspace) or qualified `"workspace/name"`; `"*"` broadcasts your visible set, `"workspace/*"` one group |
 | `message`     | `string`  | Message content                                      |
 | `triggerTurn` | `boolean` | **Required.** `true` wakes the receiver's LLM; `false` delivers passively (busy = steered into the live run; idle = stored, not processed) |
 
@@ -336,7 +335,7 @@ When `triggerTurn` is `true`, the message is queued in the receiver's local inbo
 
 Note: `triggerTurn` does **not** cause the response to come back to the caller - use `link_prompt` for that.
 
-> **Broadcast note:** Sending to `"*"` delivers to **all other terminals** - the sender is excluded.
+> **Broadcast note:** Sending to `"*"` delivers to your visible set — a regular terminal reaches its own workspace plus global members; a global member reaches everyone. `"workspace/*"` targets one group (a regular may target only its own). The sender is excluded.
 
 Pre-validates the target name against the local terminal list before sending, catching typos early. See [Message Routing](#message-routing--error-handling) for delivery semantics. **Self-target rejection** - sending to yourself (`to` equals your own name) returns an immediate error.
 
@@ -346,7 +345,7 @@ Send a prompt to a remote terminal and **wait** for the LLM's response (synchron
 
 | Parameter | Type     | Description          |
 | --------- | -------- | -------------------- |
-| `to`      | `string` | Target terminal name |
+| `to`      | `string` | Target terminal address: bare name (your own workspace) or qualified `"workspace/name"` |
 | `prompt`  | `string` | Prompt text to send  |
 
 - The remote terminal processes the prompt via `pi.sendUserMessage()` - as if a user typed it.
@@ -399,7 +398,7 @@ Ask another terminal to compact its context window and **wait** until it finishe
 
 | Parameter      | Type     | Description                                            |
 | -------------- | -------- | ------------------------------------------------------ |
-| `to`           | `string` | Target terminal name                                   |
+| `to`           | `string` | Target terminal address: bare name (your own workspace) or qualified `"workspace/name"` |
 | `instructions` | `string` | Optional custom compaction instructions for the target |
 
 - The remote terminal runs `ctx.compact()` — the same code path as `/compact`. The call returns once the runtime reports completion.
@@ -417,7 +416,7 @@ Set a terminal's declared context budget (ADR-0005) — the one compaction-decis
 
 | Parameter | Type              | Description                                                                                          |
 | --------- | ----------------- | ---------------------------------------------------------------------------------------------------- |
-| `to`      | `string`          | Target terminal name (self allowed)                                                                  |
+| `to`      | `string`          | Target terminal address: bare name (your own workspace) or qualified `"workspace/name"` (self allowed) |
 | `budget`  | `number \| "off"` | Absolute used-tokens ceiling (e.g. `56000`), or `"off"` to clear back to the default (`contextWindow − 100K`) |
 
 - The target updates its declared budget, **persists it to the session** (survives restart), pushes an immediate status update so peers see the new value, and acks ✓.
@@ -430,7 +429,7 @@ Ask another terminal to **start a brand-new session in place** (ADR-0006) — fr
 
 | Parameter | Type     | Description          |
 | --------- | -------- | -------------------- |
-| `to`      | `string` | Target terminal name |
+| `to`      | `string` | Target terminal address: bare name (your own workspace) or qualified `"workspace/name"` |
 
 - **Ack-before-teardown** — the target acks first, carrying its `oldSessionId` (resurrection metadata; fleet convention: record it on the work ticket), because session replacement kills the responder's socket mid-flight.
 - **Identity carries** — link-name, workspace, declared budget, and connect intent are pre-written into the new session, so the new instance rejoins under the same name in the same workspace. No rename-at-new (`/link-name`'s job), no seed prompt (wait for the rejoin, then `link_prompt`).
@@ -487,7 +486,7 @@ The six tools compose into coordination shapes worth naming:
 
 With no argument, `/link-name` adopts the Pi session name. `/link-connect` joins an existing hub if one is running; otherwise it starts the hub.
 
-**Name persistence:** `/link-name` saves your preferred name to the session. Resume later and it's restored automatically. If the name is taken, the hub assigns a variant (e.g., `"builder-2"`), but your preferred name stays saved for the next reconnect. See [Name Uniqueness & Persistence](#name-uniqueness--persistence) for details.
+**Name persistence:** `/link-name` saves your preferred name to the session. Resume later and it's restored automatically. If the name is taken in your workspace (held by a *different* live session), the hub refuses loudly and stops auto-reconnect — pick another name, then `/link-connect`. If *your own* session re-registers (netsplit heal, resurrection), the hub silently takes the new socket over under the exact same name. See [Name Uniqueness & Takeover](#name-uniqueness--takeover) for details.
 
 See [Configuration](#configuration) for details on `--link`, `/link-connect`, and `/link-disconnect` behavior.
 
@@ -655,12 +654,12 @@ The hub stays a dumb fan-out (no subscriptions, no broker) — per-recipient vis
 
 ### Protocol
 
-The wire protocol consists of **11 message types**, all serialized as JSON over WebSocket frames. Cwd and context fields are optional.
+The wire protocol (version 3, ADR-0008) consists of **11 message types**, all serialized as JSON over WebSocket frames. Cwd and context fields are optional. Every `from`/`to` is a fully qualified address (`workspace/name`); `"*"` broadcasts per the reach matrix, `"workspace/*"` targets one group. `register` carries `version`/`workspace`/`global`/`sessionId`/`budget`/`model` (guaranteed present); `welcome` echoes the version, the effective home and grant, and the visible global members.
 
 | Type               | Direction       | Purpose                                                                             |
 | ------------------ | --------------- | ----------------------------------------------------------------------------------- |
-| `register`         | Client → Hub    | First message after connecting; requests a name, optionally reports cwd and context |
-| `welcome`          | Hub → Client    | Confirms assigned name, terminal list + status/cwd/context snapshots                |
+| `register`         | Client → Hub    | First message after connecting; declares name, home workspace, global grant, sessionId |
+| `welcome`          | Hub → Client    | Confirms name, echoes effective home + grant, terminal list + snapshots             |
 | `terminal_joined`  | Hub → All       | Broadcast when a terminal joins; may include cwd and context                        |
 | `terminal_left`    | Hub → All       | Broadcast when a terminal disconnects                                               |
 | `chat`             | Any → Any/All   | Fire-and-forget message; optionally triggers LLM turn                               |
@@ -717,19 +716,24 @@ Client A            Hub              Client B
   |<-----------------|                  |
 ```
 
-### Name Uniqueness & Persistence
+### Name Uniqueness & Takeover
 
-The hub enforces unique terminal names via a `uniqueName()` function. If `"builder"` is already taken, the next terminal requesting that name is assigned `"builder-2"`, then `"builder-3"`, and so on.
+Names are unique **per workspace** (ADR-0008) — a terminal's wire identity is its qualified address `workspace/name`. The hub never renames: it accepts or refuses. `register` carries the terminal's pi `sessionId` as the identity anchor:
+
+- **Same `(workspace, name)`, same sessionId → silent takeover.** The hub adopts the new socket and closes the old one, with no `terminal_left`/`terminal_joined` churn — the fleet sees nothing. Netsplit heal and resurrection (same session file, same sessionId) both ride this path.
+- **Same `(workspace, name)`, different sessionId → loud refusal.** The hub sends a `name taken` error and closes the socket; the client sets a `nameTaken` latch (the authFailed family — no reconnect storm, `/link-connect` retries). Disambiguation belongs to the joiner: concurrent clones must self-name distinctly at the source.
+- **The hub's own identity is untouchable** — a joiner colliding with it is refused, even with the hub's sessionId.
 
 Default names are random 4-character hex IDs: `t-a1b2`, `t-c3d4`, etc.
 
-**Persistence:** `/link-name` saves the preferred name to the session via `pi.appendEntry("link-name", { name })`. On session resume, the saved name is restored and requested from the hub. Only explicit `/link-name` calls persist - hub-assigned variants like `"builder-2"` are not saved. On reconnect, the terminal always requests the preferred name, not the last runtime name.
+**Persistence:** `/link-name` saves the preferred name to the session via `pi.appendEntry("link-name", { name })`. On session resume, the saved name is restored and requested from the hub; the same sessionId makes the re-register a takeover, not a collision.
 
 **Rename guards:**
 
 - If you're already using the requested name, `/link-name` returns early (`"Already using..."`).
-- On the hub, renaming checks if the name is taken by another connected client before accepting the change.
-- On a client, the rename triggers a reconnect; the hub enforces uniqueness during re-registration and may assign a different name if taken.
+- Names containing the reserved characters `/` or `*` are refused.
+- On the hub, renaming checks if the name is taken by another connected client in the same workspace before accepting the change.
+- On a client, the rename triggers a reconnect; the hub enforces per-workspace uniqueness during re-registration and loudly refuses a taken name (`nameTaken` latch) instead of assigning a variant.
 
 **Unregistered client guard:** The hub ignores all non-`register` messages from clients that haven't completed registration, preventing protocol violations from malformed or out-of-order messages.
 
